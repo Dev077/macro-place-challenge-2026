@@ -232,7 +232,7 @@ Submissions are ranked by **average proxy cost** across all 17 IBM benchmarks (l
 | Rank | Team | Avg Proxy Cost | Best | Worst | Overlaps | Runtime | Verified | Notes |
 |------|------|---------------|------|-------|----------|---------|----------|-------|
 | 1 | "vmallela" | **1.0109** | 0.7644 | 1.2921 | 0 | 15.5h total | :white_check_mark: | Verified 1.0109 (self-reported 1.1) |
-| 2 | "DREAMPlaceProMaxUltra" | **1.0467** | — | — | 0 | 629s/bench | | New 5/10. |
+| 2 | "DREAMPlaceProMaxUltra" | **1.0121** | 0.7955 | 1.2167 | 0 | 6h total | :white_check_mark: | Verified 1.0121 (self-reported 1.0467). Built and ran from team-provided `Dockerfile`. |
 | 3 | "Vibe" | **1.1477** | — | — | 0 | 13851s total | | New 5/7. |
 | 4 | "Archgen" | **1.16511** | — | — | 0 | 3343s/bench | | Resubmitted 5/9 (was 1.3479). |
 | 5 | "ArzunPD" | **1.1883** | — | — | 0 | 55min/bench | | Resubmitted 5/8 (was 1.2478). |
@@ -240,27 +240,27 @@ Submissions are ranked by **average proxy cost** across all 17 IBM benchmarks (l
 | 7 | "Talyxion" | **1.2075** | — | — | 0 | 7.2min/bench | | New 5/10. |
 | 8 | "KLA MACH" | **1.2121** | 0.8527 | 1.6532 | 0 | 2h15min total | :white_check_mark: | Verified 1.2121 (self-reported 1.2355). Consolidates UTDA / Chuanqi Chen / KLA MACH submissions (one algorithm per team). |
 | 9 | "Hoop Dreams" | **1.2207** | 0.8972 | 1.5072 | 0 | 5h total | :white_check_mark: | Verified 1.2207 (self-reported 1.2206). Built and ran from team-provided `Dockerfile`. |
-| 10 | "Shoom" | **1.2353** | — | — | 0 | 42min/bench | | Resubmitted 5/1 (was 1.3381). |
-| 11 | "Adam_A" | **1.2655** | — | — | 0 | 682s/bench | | New 5/10. |
-| 12 | "William Zhang" | **1.2767** | — | — | 0 | 259s/bench | | Resubmitted 5/2 (was "Convex Optimization", verified 1.4556). Blocked on missing `casadi` module. |
-| 13 | "RoRa" | **1.2788** | 0.9577 | 1.6222 | 0 | 2.6h total | :white_check_mark: | Verified 1.2788 (self-reported 1.2723). Resubmitted 5/1. |
-| 14 | "MTK" | **1.2818** | 0.9073 | 1.6529 | 0 | 37s/bench (GPU) | :white_check_mark: | Verified 1.2818 (self-reported 1.317). |
-| 15 | "Electric Beatle" | **1.3253** | — | — | 0 | 2000s/bench (GPU) | | Resubmitted 4/30 (was verified 1.3913). |
-| 16 | "UToronto Analytical" | **1.3323** | 0.9371 | 1.6545 | 0 | 24min total | :white_check_mark: | Verified 1.3323 (self-reported 1.3325). |
-| 17 | "V5" | **1.3382** | — | — | 0 | 850s/bench | | New 4/23. |
-| 18 | "jrslbenn" | **1.353** | — | — | 0 | 750s/bench | | New 5/4. |
-| 19 | "Barsat Khadka" | **1.38** | — | — | 0 | 1000-1800s/bench | | New 5/5. |
-| 20 | "Varun's Parallel Worlds" | **1.4017** | 1.0362 | 1.7298 | 0 | 27s/bench | :white_check_mark: | |
-| 21 | "UT Austin - AS" | **1.4076** | — | — | 0 | 17s/bench | | |
-| 22 | "ByteDancer" | **1.4151** | 1.0236 | 1.7792 | 0 | 38min/bench | :white_check_mark: | |
-| 23 | "TAISPlAce" | **1.4321** | — | — | 0 | 28min/bench | | |
-| 24 | "Two-IIITK-Kids" | **1.436** | — | — | 0 | 38min/bench | | New 5/2, resubmitted 5/4. |
-| 25 | "Pragnay" | **1.4427** | — | — | 0 | 632s/bench | | Blocked on `compute_proxy_cost(..., plc=None)` in fallback path. |
-| 26 | "No Man's Sky" | **1.4445** | — | — | 0 | 8.8min/bench | | New 5/4, resubmitted 5/6. |
-| 27 | "Aegir" | **1.4553** | — | — | 0 | 104s/bench | | New 5/9. |
-| 28 | "another Waterloo kid" | **1.4568** | — | — | 0 | 118s/bench | | Blocked on Modal cloud dispatch — can't run air-gapped. |
+| 10 | "Adam_A" | **1.2655** | — | — | 0 | 682s/bench | | New 5/10. |
+| 11 | "William Zhang" | **1.2767** | — | — | 0 | 259s/bench | | Resubmitted 5/2 (was "Convex Optimization", verified 1.4556). Blocked on missing `casadi` module. |
+| 12 | "RoRa" | **1.2788** | 0.9577 | 1.6222 | 0 | 2.6h total | :white_check_mark: | Verified 1.2788 (self-reported 1.2723). Resubmitted 5/1. |
+| 13 | "MTK" | **1.2818** | 0.9073 | 1.6529 | 0 | 37s/bench (GPU) | :white_check_mark: | Verified 1.2818 (self-reported 1.317). |
+| 14 | "Electric Beatle" | **1.3253** | — | — | 0 | 2000s/bench (GPU) | | Resubmitted 4/30 (was verified 1.3913). |
+| 15 | "UToronto Analytical" | **1.3323** | 0.9371 | 1.6545 | 0 | 24min total | :white_check_mark: | Verified 1.3323 (self-reported 1.3325). |
+| 16 | "V5" | **1.3382** | — | — | 0 | 850s/bench | | New 4/23. |
+| 17 | "jrslbenn" | **1.353** | — | — | 0 | 750s/bench | | New 5/4. |
+| 18 | "Barsat Khadka" | **1.38** | — | — | 0 | 1000-1800s/bench | | New 5/5. |
+| 19 | "Varun's Parallel Worlds" | **1.4017** | 1.0362 | 1.7298 | 0 | 27s/bench | :white_check_mark: | |
+| 20 | "UT Austin - AS" | **1.4076** | — | — | 0 | 17s/bench | | |
+| 21 | "ByteDancer" | **1.4151** | 1.0236 | 1.7792 | 0 | 38min/bench | :white_check_mark: | |
+| 22 | "TAISPlAce" | **1.4321** | — | — | 0 | 28min/bench | | |
+| 23 | "Two-IIITK-Kids" | **1.436** | — | — | 0 | 38min/bench | | New 5/2, resubmitted 5/4. |
+| 24 | "Pragnay" | **1.4427** | — | — | 0 | 632s/bench | | Blocked on `compute_proxy_cost(..., plc=None)` in fallback path. |
+| 25 | "No Man's Sky" | **1.4445** | — | — | 0 | 8.8min/bench | | New 5/4, resubmitted 5/6. |
+| 26 | "Aegir" | **1.4553** | — | — | 0 | 104s/bench | | New 5/9. |
+| 27 | "another Waterloo kid" | **1.4568** | — | — | 0 | 118s/bench | | Blocked on Modal cloud dispatch — can't run air-gapped. |
 | — | RePlAce (baseline) | **1.4578** | 0.9976 | 1.8370 | 0 | — | :white_check_mark: | |
-| 29 | "W3 Solutions" | **1.4824** | — | — | 0 | 90s/bench | | Runtime exceeds 1h/bench cap. |
+| 28 | "W3 Solutions" | **1.4824** | — | — | 0 | 90s/bench | | Runtime exceeds 1h/bench cap. |
+| 29 | "Shoom" | **1.4901** | 1.1111 | 1.7884 | 0 | 12h total | :white_check_mark: | Verified 1.4901 (self-reported 1.2353). Bundled DREAMPlace incompatible with NumPy 2.0 (`np.string_` removed); ran fallback SA only. |
 | 30 | "Jiangban Ya" | **1.4943** | 1.0891 | 1.8099 | 0 | 49s/bench | :white_check_mark: | |
 | 31 | "UTAUSTIN-CT" | **1.5062** | 1.1363 | 1.7941 | 0 | 6s/bench | :white_check_mark: | |
 | 32 | "oracleX" | **1.5130** | 1.1340 | 1.7937 | 0 | 11s/bench | :white_check_mark: | |
