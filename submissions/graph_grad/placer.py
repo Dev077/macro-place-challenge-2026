@@ -960,15 +960,16 @@ class GraphGradPlacer:
     def __init__(
         self,
         seed: int = 42,
-        pop_size: int = 32,
+        pop_size: int = 96,                # 3× the original to use Blackwell VRAM
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
         grid_res: int = 32,
-        time_budget_s: float = 3000.0,  # 50 min
+        time_budget_s: float = 3000.0,     # 50 min
         verbose: bool = False,
-        lock_hard: bool = True,            # NEW: lock hard macros at legalized initial.plc
-        soft_steps: int = 3000,            # NEW: total Adam steps in soft-only mode
-        soft_lr: float = 0.01,             # NEW: Adam lr in soft-only mode
+        lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
+        soft_steps: int = 5000,            # Total Adam steps (was 3000)
+        soft_lr: float = 0.01,
+        n_restarts: int = 1,               # Independent restarts with different RNG seeds
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -980,6 +981,7 @@ class GraphGradPlacer:
         self.lock_hard = lock_hard
         self.soft_steps = soft_steps
         self.soft_lr = soft_lr
+        self.n_restarts = n_restarts
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1012,15 +1014,32 @@ class GraphGradPlacer:
         (density is an exact TILOS port; RUDY congestion is the best
         differentiable approximation but its gradient direction is correct).
 
+        If ``n_restarts > 1`` the optimization runs that many times with
+        different RNG seeds and the overall best (by true proxy) is kept.
+
         Safety net: if no candidate beats the legalized anchor's true proxy,
         the anchor is returned.
         """
+        best_across = None
+        best_across_cost = float("inf")
+        for r in range(self.n_restarts):
+            run_seed = self.seed + 1000 * r
+            full, cost = self._soft_only_single_run(benchmark, run_seed)
+            if cost < best_across_cost:
+                best_across_cost = cost
+                best_across = full
+            if self.verbose and self.n_restarts > 1:
+                self._log(f"restart {r+1}/{self.n_restarts}: proxy={cost:.4f}  best={best_across_cost:.4f}")
+        return best_across
+
+    def _soft_only_single_run(self, benchmark: Benchmark, run_seed: int):
+        """One soft-only optimization run.  Returns (placement_tensor, true_proxy)."""
         from macro_place.objective import compute_proxy_cost
 
         t_start = time.time()
-        torch.manual_seed(self.seed)
-        np.random.seed(self.seed)
-        random.seed(self.seed)
+        torch.manual_seed(run_seed)
+        np.random.seed(run_seed)
+        random.seed(run_seed)
         device = _device()
 
         n_hard = benchmark.num_hard_macros
@@ -1139,7 +1158,7 @@ class GraphGradPlacer:
             f"soft-only: best true_proxy={best_cost:.4f}  "
             f"anchor={anchor_str}  time={time.time()-t_start:.1f}s"
         )
-        return best_full
+        return best_full, best_cost
 
     def _place_joint(self, benchmark: Benchmark) -> torch.Tensor:
         """Original joint hard + soft gradient mode (kept for comparison)."""
