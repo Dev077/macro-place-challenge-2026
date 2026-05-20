@@ -966,6 +966,9 @@ class GraphGradPlacer:
         grid_res: int = 32,
         time_budget_s: float = 3000.0,  # 50 min
         verbose: bool = False,
+        lock_hard: bool = True,            # NEW: lock hard macros at legalized initial.plc
+        soft_steps: int = 3000,            # NEW: total Adam steps in soft-only mode
+        soft_lr: float = 0.01,             # NEW: Adam lr in soft-only mode
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -974,6 +977,9 @@ class GraphGradPlacer:
         self.grid_res = grid_res
         self.time_budget_s = time_budget_s
         self.verbose = verbose
+        self.lock_hard = lock_hard
+        self.soft_steps = soft_steps
+        self.soft_lr = soft_lr
 
     def _log(self, msg: str):
         if self.verbose:
@@ -988,6 +994,155 @@ class GraphGradPlacer:
             return float("inf")
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
+        # Hard-locked soft-only mode (proven sub-anchor on ibm01: 0.886 vs 1.039).
+        # See _place_soft_only for the full schedule + safety net.
+        if self.lock_hard:
+            return self._place_soft_only(benchmark)
+        return self._place_joint(benchmark)
+
+    def _place_soft_only(self, benchmark: Benchmark) -> torch.Tensor:
+        """
+        Soft-only TILOS-faithful gradient placer.
+
+        Hard macros are legalized once at the initial.plc layout and *locked*
+        (their Adam gradients are zeroed every step).  Only soft macros move,
+        optimizing the proxy-mirror surrogate
+            ``wl_normalized + 0.5 * tilos_density + 0.5 * tilos_rudy``
+        which matches ``compute_proxy_cost`` weighting and component scales
+        (density is an exact TILOS port; RUDY congestion is the best
+        differentiable approximation but its gradient direction is correct).
+
+        Safety net: if no candidate beats the legalized anchor's true proxy,
+        the anchor is returned.
+        """
+        from macro_place.objective import compute_proxy_cost
+
+        t_start = time.time()
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        random.seed(self.seed)
+        device = _device()
+
+        n_hard = benchmark.num_hard_macros
+        n_macros = benchmark.num_macros
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
+        sizes_all = benchmark.macro_sizes.to(device).float()
+        sizes_np = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
+        movable_np = benchmark.get_movable_mask()[:n_hard].numpy()
+        owner_idx, pin_off, net_id, n_nets = _build_pin_tensors(benchmark, device)
+        port_pos = benchmark.port_positions.to(device).float()
+        half_w_t = sizes_all[:, 0] / 2
+        half_h_t = sizes_all[:, 1] / 2
+        grid_col = int(benchmark.grid_cols)
+        grid_row = int(benchmark.grid_rows)
+        h_per_um = float(benchmark.hroutes_per_micron)
+        v_per_um = float(benchmark.vroutes_per_micron)
+
+        # Legalize hard macros once at initial.plc → anchor.
+        init_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64)
+        hard_legal = _legalize(init_pos, sizes_np, movable_np, cw, ch, gap=0.005)
+        hard_legal_t = torch.tensor(hard_legal, device=device, dtype=torch.float32)
+        soft_anchor = benchmark.macro_positions[n_hard:].to(device).float()
+        self._log(
+            f"soft-only setup: n_hard={n_hard} n_soft={n_macros - n_hard} "
+            f"n_nets={n_nets}  grid {grid_col}x{grid_row}  H/V {h_per_um:.2f}/{v_per_um:.2f}  "
+            f"device={device}"
+        )
+
+        # Population: every seed shares the same locked hard layout;
+        # soft starts at initial soft + small jitter.
+        K = self.pop_size
+        pop = torch.zeros(K, n_macros, 2, device=device, dtype=torch.float32)
+        pop[:, :n_hard] = hard_legal_t
+        pop[:, n_hard:] = soft_anchor + torch.randn(K, n_macros - n_hard, 2, device=device) * 0.1
+        pop.requires_grad_(True)
+        opt = torch.optim.Adam([pop], lr=self.soft_lr)
+
+        n_steps = self.soft_steps
+        for step in range(n_steps):
+            opt.zero_grad()
+            progress = step / max(n_steps, 1)
+            gamma = 1.0 * (0.05 ** progress)  # WAHPWL smoothing → sharp Manhattan HPWL
+            wl_n = tilos_wl_normalized(
+                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                n_hard, n_macros, gamma, cw, ch,
+            )
+            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
+            cong = tilos_rudy_normalized(
+                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                n_hard, n_macros, grid_col, grid_row, cw, ch,
+                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+            )
+            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong  # mirrors compute_proxy_cost
+            loss = proxy_surr.sum()
+            loss.backward()
+            with torch.no_grad():
+                pop.grad[:, :n_hard].zero_()  # LOCK hard macros
+            opt.step()
+            with torch.no_grad():
+                pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
+                pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
+                pop[:, :n_hard] = hard_legal_t  # reassert lock
+            if self.verbose and step % max(n_steps // 6, 1) == 0:
+                self._log(
+                    f"  step {step}: wl_n={wl_n.mean().item():.4f} "
+                    f"dens={dens.mean().item():.4f} cong={cong.mean().item():.4f} "
+                    f"proxy_surr={proxy_surr.mean().item():.4f}"
+                )
+
+        # Rank candidates by surrogate; evaluate top-K' by TRUE proxy.
+        with torch.no_grad():
+            wl_n = tilos_wl_normalized(
+                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                n_hard, n_macros, 0.05, cw, ch,
+            )
+            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
+            cong = tilos_rudy_normalized(
+                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                n_hard, n_macros, grid_col, grid_row, cw, ch,
+                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+            )
+            surr = wl_n + 0.5 * dens + 0.5 * cong
+        k_eval = min(K, max(8, K // 2))
+        top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
+
+        # Cache plc once — each _load_plc reparses the netlist (~seconds)
+        plc = _load_plc(benchmark.name)
+        best_full, best_cost = None, float("inf")
+        for k in top_idx:
+            pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
+            pos_full = self._clip_soft_to_canvas(pos_full, benchmark, n_hard, cw, ch)
+            full_t = torch.from_numpy(pos_full).float()
+            if plc is None:
+                continue
+            c = compute_proxy_cost(full_t, benchmark, plc)
+            if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
+                best_cost = c["proxy_cost"]
+                best_full = full_t
+        # Anchor safety net
+        full_anc = torch.zeros(n_macros, 2)
+        full_anc[:n_hard] = hard_legal_t.cpu()
+        full_anc[n_hard:] = soft_anchor.cpu()
+        full_anc_np = full_anc.numpy().astype(np.float64)
+        full_anc_np = self._clip_soft_to_canvas(full_anc_np, benchmark, n_hard, cw, ch)
+        full_anc = torch.from_numpy(full_anc_np).float()
+        c_anc = compute_proxy_cost(full_anc, benchmark, plc) if plc is not None else None
+        if c_anc is not None and c_anc["proxy_cost"] < best_cost:
+            best_cost = c_anc["proxy_cost"]
+            best_full = full_anc
+        if best_full is None:
+            best_full = full_anc
+
+        anchor_str = f"{c_anc['proxy_cost']:.4f}" if c_anc is not None else "NA"
+        self._log(
+            f"soft-only: best true_proxy={best_cost:.4f}  "
+            f"anchor={anchor_str}  time={time.time()-t_start:.1f}s"
+        )
+        return best_full
+
+    def _place_joint(self, benchmark: Benchmark) -> torch.Tensor:
+        """Original joint hard + soft gradient mode (kept for comparison)."""
         t_start = time.time()
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
