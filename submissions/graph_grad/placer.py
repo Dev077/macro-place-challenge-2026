@@ -1030,15 +1030,55 @@ class GraphGradPlacer:
         plc_cached = _load_plc(benchmark.name)
         best_across = None
         best_across_cost = float("inf")
-        for r in range(self.n_restarts):
-            run_seed = self.seed + 1000 * r
-            self._log(f"restart {r+1}/{self.n_restarts} (seed={run_seed})")
+
+        # ── Time-budget-driven adaptive restarts ──
+        # Run as many independent restarts as fit in self.time_budget_s.
+        # Each restart explores K=pop_size diverse hard layouts with a fresh
+        # RNG seed, so more passes = more independent search.  This uses the
+        # full 55-min/bench budget instead of throwing away the time after a
+        # fixed n_restarts cap.
+        t_start = time.time()
+        t_end = t_start + self.time_budget_s * 0.95  # 5% slack for final assembly
+        t_per_restart_estimate = None
+        n_done = 0
+        hard_cap = max(self.n_restarts, 200)  # safety: never spin forever
+        while n_done < hard_cap:
+            # If we have a runtime estimate, only start a restart that fits
+            if t_per_restart_estimate is not None:
+                if time.time() + t_per_restart_estimate * 1.05 > t_end:
+                    self._log(
+                        f"budget exhausted after {n_done} restarts "
+                        f"(est {t_per_restart_estimate:.0f}s/restart, "
+                        f"{t_end - time.time():.0f}s remaining)"
+                    )
+                    break
+            run_seed = self.seed + 1000 * (n_done + 1)
+            elapsed = time.time() - t_start
+            self._log(
+                f"restart {n_done+1} (seed={run_seed}, elapsed={elapsed:.0f}s, "
+                f"budget={self.time_budget_s:.0f}s)"
+            )
+            t0 = time.time()
             full, cost = self._soft_only_single_run(benchmark, run_seed, plc_cached)
+            dt = time.time() - t0
+            # Update runtime estimate (slight EMA for stability)
+            if t_per_restart_estimate is None:
+                t_per_restart_estimate = dt
+            else:
+                t_per_restart_estimate = 0.5 * t_per_restart_estimate + 0.5 * dt
+            n_done += 1
             if cost < best_across_cost:
                 best_across_cost = cost
                 best_across = full
-            if self.verbose and self.n_restarts > 1:
-                self._log(f"  → proxy={cost:.4f}  best_so_far={best_across_cost:.4f}")
+                self._log(f"  → NEW BEST proxy={cost:.4f}  ({dt:.0f}s)")
+            else:
+                self._log(
+                    f"  → proxy={cost:.4f} (best stays {best_across_cost:.4f}, {dt:.0f}s)"
+                )
+        self._log(
+            f"completed {n_done} restarts in {time.time()-t_start:.0f}s, "
+            f"best proxy={best_across_cost:.4f}"
+        )
         return best_across
 
     def _soft_only_single_run(self, benchmark: Benchmark, run_seed: int, plc_shared=None):
