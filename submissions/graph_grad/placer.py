@@ -595,6 +595,201 @@ def rudy_congestion(
     return sorted_c[:, :k_top].pow(2).sum(dim=1)
 
 
+def tilos_density_loss(
+    pop: torch.Tensor,
+    sizes: torch.Tensor,
+    grid_col: int,
+    grid_row: int,
+    cw: float,
+    ch: float,
+) -> torch.Tensor:
+    """
+    Faithful port of plc_client_os.PlacementCost.get_density_cost.
+
+    For each macro (hard + soft), accumulate (macro ∩ cell) area into a
+    ``[grid_row, grid_col]`` grid; per-cell density = occupied_area / grid_area.
+    Then return ``0.5 * mean(top-10% of cells)`` — *the exact same formula*
+    as TILOS, with the same 0.5 prefactor and the same top-K count
+    (``floor(num_cells * 0.1)``).
+
+    This is differentiable everywhere via min/max + sort.
+    """
+    K, N, _ = pop.shape
+    grid_w = cw / grid_col
+    grid_h = ch / grid_row
+    grid_area = grid_w * grid_h
+    total_cells = grid_col * grid_row
+    k_top = max(1, int(total_cells * 0.1))
+
+    # Cell edges
+    col_idx = torch.arange(grid_col, device=pop.device, dtype=pop.dtype)
+    row_idx = torch.arange(grid_row, device=pop.device, dtype=pop.dtype)
+    col_l = col_idx * grid_w
+    col_r = col_l + grid_w
+    row_b = row_idx * grid_h
+    row_t = row_b + grid_h
+
+    x = pop[..., 0]  # [K, N]
+    y = pop[..., 1]
+    hw = sizes[:, 0] / 2  # [N]
+    hh = sizes[:, 1] / 2
+    macro_l = (x - hw.unsqueeze(0)).unsqueeze(-1)  # [K, N, 1]
+    macro_r = (x + hw.unsqueeze(0)).unsqueeze(-1)
+    macro_b_ = (y - hh.unsqueeze(0)).unsqueeze(-1)
+    macro_t_ = (y + hh.unsqueeze(0)).unsqueeze(-1)
+    col_lb = col_l.view(1, 1, grid_col)
+    col_rb = col_r.view(1, 1, grid_col)
+    row_bb = row_b.view(1, 1, grid_row)
+    row_tb = row_t.view(1, 1, grid_row)
+
+    x_ov = (torch.min(macro_r, col_rb) - torch.max(macro_l, col_lb)).clamp(min=0.0)  # [K, N, Gx]
+    y_ov = (torch.min(macro_t_, row_tb) - torch.max(macro_b_, row_bb)).clamp(min=0.0)  # [K, N, Gy]
+    occupied = torch.einsum("knx,kny->kyx", x_ov, y_ov)  # [K, Gy, Gx]
+    density = occupied / grid_area  # [K, Gy, Gx]
+    cells = density.reshape(K, -1)
+    sorted_d, _ = torch.sort(cells, dim=1, descending=True)
+    # TILOS: sum of top-K density / K (top-K count is floor(total*0.1))
+    top_sum = sorted_d[:, :k_top].sum(dim=1)
+    return 0.5 * (top_sum / k_top)  # [K]  — matches get_density_cost()
+
+
+def tilos_wl_normalized(
+    pop: torch.Tensor,
+    owner_idx: torch.Tensor,
+    pin_off: torch.Tensor,
+    net_id: torch.Tensor,
+    n_nets: int,
+    port_pos: torch.Tensor,
+    n_hard: int,
+    n_macros: int,
+    gamma: float,
+    cw: float,
+    ch: float,
+) -> torch.Tensor:
+    """
+    WAHPWL normalized exactly the way ``PlacementCost.get_cost()`` normalizes:
+        proxy_wl = total_HPWL / ((canvas_w + canvas_h) * net_cnt)
+
+    As γ → 0 the WAHPWL converges to true Manhattan HPWL, so this matches the
+    proxy's wirelength_cost in the limit.
+    """
+    raw = wahpwl(pop, owner_idx, pin_off, net_id, n_nets, port_pos, n_hard, n_macros, gamma)
+    return raw / ((cw + ch) * max(n_nets, 1))
+
+
+def tilos_rudy_normalized(
+    pop: torch.Tensor,
+    owner_idx: torch.Tensor,
+    pin_off: torch.Tensor,
+    net_id: torch.Tensor,
+    n_nets: int,
+    port_pos: torch.Tensor,
+    n_hard: int,
+    n_macros: int,
+    grid_col: int,
+    grid_row: int,
+    cw: float,
+    ch: float,
+    h_routes_per_um: float,
+    v_routes_per_um: float,
+    smooth_range: int = 2,
+    k_frac: float = 0.05,
+) -> torch.Tensor:
+    """
+    RUDY surrogate normalized as close to TILOS as a continuous approximation
+    allows.  Differs from the exact TILOS routing (which is discrete L/T
+    Steiner routing per net) but applies *the same per-axis normalisation*
+    and *the same 1-D smoothing kernel*.
+
+    Steps:
+      1. Compute per-net bbox via hard min/max scatter (subgradient via
+         torch.min/max).
+      2. H-demand per cell = (wl_x / bbox_area) × (cell ∩ bbox area).
+         V-demand similarly.
+      3. Normalise V by grid_v_routes = grid_w × v_routes_per_um and H by
+         grid_h_routes = grid_h × h_routes_per_um (same as TILOS).
+      4. Apply TILOS's 1-D smoothing: V along columns, H along rows, kernel
+         size = 2*smooth_range + 1.
+      5. Concatenate V+H lists and return top-5% mean (TILOS's abu).
+    """
+    K = pop.shape[0]
+    device = pop.device
+    n_ports = port_pos.shape[0]
+    if n_ports > 0:
+        ports_b = port_pos.unsqueeze(0).expand(K, n_ports, 2)
+        owner_pos = torch.cat([pop, ports_b], dim=1)
+    else:
+        owner_pos = pop
+    pin_pos = owner_pos[:, owner_idx, :] + pin_off.unsqueeze(0)
+    x = pin_pos[..., 0]
+    y = pin_pos[..., 1]
+    idx = net_id.unsqueeze(0).expand(K, -1)
+    big = 1e9
+    x_max = torch.full((K, n_nets), -big, device=device, dtype=pop.dtype)
+    x_min = torch.full((K, n_nets), big, device=device, dtype=pop.dtype)
+    y_max = torch.full((K, n_nets), -big, device=device, dtype=pop.dtype)
+    y_min = torch.full((K, n_nets), big, device=device, dtype=pop.dtype)
+    x_max.scatter_reduce_(1, idx, x, reduce="amax", include_self=True)
+    x_min.scatter_reduce_(1, idx, x, reduce="amin", include_self=True)
+    y_max.scatter_reduce_(1, idx, y, reduce="amax", include_self=True)
+    y_min.scatter_reduce_(1, idx, y, reduce="amin", include_self=True)
+    bbox_w = (x_max - x_min).clamp(min=1e-3)
+    bbox_h = (y_max - y_min).clamp(min=1e-3)
+    bbox_area = bbox_w * bbox_h
+
+    grid_w = cw / grid_col
+    grid_h = ch / grid_row
+    col_idx = torch.arange(grid_col, device=device, dtype=pop.dtype)
+    row_idx = torch.arange(grid_row, device=device, dtype=pop.dtype)
+    col_l = col_idx * grid_w
+    col_r = col_l + grid_w
+    row_b = row_idx * grid_h
+    row_t = row_b + grid_h
+    bxl = x_min.unsqueeze(-1); bxr = x_max.unsqueeze(-1)
+    byb = y_min.unsqueeze(-1); byt = y_max.unsqueeze(-1)
+    col_lb = col_l.view(1, 1, grid_col); col_rb = col_r.view(1, 1, grid_col)
+    row_bb = row_b.view(1, 1, grid_row); row_tb = row_t.view(1, 1, grid_row)
+    x_ov = (torch.min(bxr, col_rb) - torch.max(bxl, col_lb)).clamp(min=0.0)  # [K, n_nets, Gx]
+    y_ov = (torch.min(byt, row_tb) - torch.max(byb, row_bb)).clamp(min=0.0)  # [K, n_nets, Gy]
+    # H demand: per-cell contribution = (wl_x / area) × x_ov × y_ov  = x_ov × y_ov / bbox_h
+    inv_h = (1.0 / bbox_h).unsqueeze(-1)
+    inv_w = (1.0 / bbox_w).unsqueeze(-1)
+    h_per_n_x = inv_h * x_ov  # [K, n_nets, Gx]
+    v_per_n_x = inv_w * x_ov  # [K, n_nets, Gx]  (RUDY V also occupies a vertical strip)
+    h_dem = torch.einsum("knx,kny->kyx", h_per_n_x, y_ov)  # [K, Gy, Gx]
+    v_dem = torch.einsum("knx,kny->kyx", v_per_n_x, y_ov)
+
+    # Normalize per-axis by routing track capacity (matches TILOS):
+    grid_v_routes = grid_w * v_routes_per_um
+    grid_h_routes = grid_h * h_routes_per_um
+    v_dem = v_dem / max(grid_v_routes, 1e-9)
+    h_dem = h_dem / max(grid_h_routes, 1e-9)
+
+    # TILOS smoothing — 1-D box-filter along axis of routing, width 2*smooth_range+1
+    if smooth_range > 0:
+        ksz = 2 * smooth_range + 1
+        # V routing congestion smooths along columns (axis Gx); H smooths along rows (axis Gy).
+        # Use conv1d with appropriate reshaping.
+        v_dem_r = v_dem.unsqueeze(1)  # [K, 1, Gy, Gx]
+        h_dem_r = h_dem.unsqueeze(1)
+        # Build a 1-D smoothing kernel that sums (TILOS divides BEFORE distribution then sums after)
+        # TILOS effective effect: each cell averages with its kernel-window neighbours and
+        # the same value gets *added* into adjacent cells (see __smooth_routing_cong) — net
+        # effect is a box filter normalised by (kernel-size at that location).
+        # We approximate with a simple box filter of length ksz.
+        kx = torch.ones(1, 1, 1, ksz, device=device, dtype=pop.dtype) / ksz
+        ky = torch.ones(1, 1, ksz, 1, device=device, dtype=pop.dtype) / ksz
+        v_dem = torch.nn.functional.conv2d(v_dem_r, kx, padding=(0, smooth_range)).squeeze(1)
+        h_dem = torch.nn.functional.conv2d(h_dem_r, ky, padding=(smooth_range, 0)).squeeze(1)
+
+    # TILOS concatenates V_cong + H_cong and takes top-5% mean
+    flat = torch.cat([v_dem.reshape(K, -1), h_dem.reshape(K, -1)], dim=1)  # [K, 2*Gy*Gx]
+    total = flat.shape[1]
+    k_top = max(1, int(total * k_frac))
+    sorted_c, _ = torch.sort(flat, dim=1, descending=True)
+    return sorted_c[:, :k_top].mean(dim=1)  # [K]
+
+
 def anchor_reg(
     pop: torch.Tensor, anchor: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
@@ -847,44 +1042,56 @@ class GraphGradPlacer:
         n_anchored = max(2, K // 2)
         for k in range(n_anchored):
             anchor_mask[k] = 1.0 if k == 0 else 0.5
+
+        # TILOS-faithful grid + routing parameters
+        grid_col = int(benchmark.grid_cols)
+        grid_row = int(benchmark.grid_rows)
+        h_per_um = float(benchmark.hroutes_per_micron)
+        v_per_um = float(benchmark.vroutes_per_micron)
+        smooth_rng = 2  # TILOS default for the IBM benchmarks
+        self._log(
+            f"TILOS surrogate: grid {grid_col}x{grid_row}  H/V tracks {h_per_um:.2f}/{v_per_um:.2f}  smooth={smooth_rng}"
+        )
+
         for epoch in range(self.n_epochs):
             if time.time() - t_start > self.time_budget_s * 0.85:
                 self._log(f"epoch {epoch}: budget exhausted, breaking")
                 break
             progress = epoch / max(1, self.n_epochs - 1)
-            gamma = 2.0 * (0.05) ** progress             # 2.0 → 0.1
-            alpha_dens = 0.01 * (1000.0) ** progress      # 0.01 → 10
-            alpha_cong = 0.001 * (5000.0) ** progress     # 0.001 → 5  (RUDY)
-            alpha_ov = 1.0 * (2000.0) ** progress         # 1 → 2000
-            alpha_anchor = 30.0 * (0.05) ** progress      # 30 → 1.5 (slow release, keeps anchored seeds near initial.plc)
+            gamma = 2.0 * (0.05) ** progress             # 2.0 → 0.1  (WAHPWL smoothing)
+            alpha_ov = 1.0 * (5000.0) ** progress         # 1 → 5000 (overlap pressure ramps hard)
+            alpha_anchor = 30.0 * (0.05) ** progress      # 30 → 1.5 (slow release)
             lr = 0.05 * (0.02) ** progress                # 0.05 → 0.001
             for pg in opt.param_groups:
                 pg["lr"] = lr
 
             self._log(
-                f"epoch {epoch+1}/{self.n_epochs}: γ={gamma:.3f} α_den={alpha_dens:.3f} α_cong={alpha_cong:.3f} α_ov={alpha_ov:.1f} α_anc={alpha_anchor:.2f} lr={lr:.4f}"
+                f"epoch {epoch+1}/{self.n_epochs}: γ={gamma:.3f} α_ov={alpha_ov:.1f} α_anc={alpha_anchor:.2f} lr={lr:.4f}"
             )
 
             for step in range(self.steps_per_epoch):
                 opt.zero_grad()
-                wl = wahpwl(
+                # The TILOS-faithful proxy surrogate:
+                #   proxy_surrogate = wl_norm + 0.5 * tilos_density + 0.5 * tilos_rudy
+                # WL is normalized exactly like get_cost() (raw_HPWL / ((cw+ch)*n_nets)).
+                # Density is the exact TILOS top-10% mean × 0.5.
+                # Congestion is the differentiable RUDY approximation with TILOS's
+                # H/V track normalization and 1-D smoothing kernel.
+                wl_n = tilos_wl_normalized(
                     pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                    n_hard, n_macros, gamma,
+                    n_hard, n_macros, gamma, cw, ch,
                 )
-                dens = density_top_k(pop, sizes_all, self.grid_res, cw, ch, k_frac=0.1)
-                cong = rudy_congestion(
+                dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
+                cong = tilos_rudy_normalized(
                     pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                    n_hard, n_macros, max(self.grid_res // 2, 8), cw, ch, k_frac=0.05,
+                    n_hard, n_macros, grid_col, grid_row, cw, ch,
+                    h_per_um, v_per_um, smooth_range=smooth_rng, k_frac=0.05,
                 )
                 ov = overlap_loss_hard(pop[:, :n_hard], sizes_hard)
                 anch = anchor_reg(pop, anchor_pos_t, anchor_mask)
-                loss = (
-                    wl
-                    + alpha_dens * dens
-                    + alpha_cong * cong
-                    + alpha_ov * ov
-                    + alpha_anchor * anch
-                ).sum()
+                # proxy surrogate (mirrors compute_proxy_cost weights exactly)
+                proxy_surr = wl_n + 0.5 * dens + 0.5 * cong
+                loss = (proxy_surr + alpha_ov * ov + alpha_anchor * anch).sum()
                 loss.backward()
                 opt.step()
                 with torch.no_grad():
