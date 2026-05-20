@@ -969,7 +969,7 @@ class GraphGradPlacer:
         lock_hard: bool = True,
         soft_steps: int = 20000,           # 2× more Adam steps
         soft_lr: float = 0.01,
-        n_restarts: int = 2,               # Fewer restarts → less CPU eval stall
+        n_restarts: int = 4,               # Independent RNG searches; cheap now that eval_top_k=4
         cong_calibrate: bool = True,
         eval_top_k: int = 4,               # NEW: candidates to evaluate by true plc.get_cost
     ):
