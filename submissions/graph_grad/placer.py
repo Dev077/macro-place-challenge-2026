@@ -1122,14 +1122,37 @@ class GraphGradPlacer:
                 f"  cong calibration: true={true_cong:.4f}  surr={surr_cong_anchor:.4f}  scale={cong_scale:.2f}"
             )
 
-        # Population: every seed shares the same locked hard layout;
-        # soft starts at initial soft + small jitter.
+        # ── DIVERSE-HARD population ──
+        # Build K seeds via the graph-aware seed builder — each provides its
+        # own legalized hard layout (spectral/Fiedler, force-directed, jittered
+        # initial.plc, etc.).  Each seed's hard arrangement is *locked
+        # independently* — the K members of the population explore K different
+        # hard placements in parallel, each optimizing its own soft macros.
+        # This is the change that lets us escape the initial.plc basin on
+        # benchmarks where it's a suboptimal hard arrangement.
         K = self.pop_size
-        pop = torch.zeros(K, n_macros, 2, device=device, dtype=torch.float32)
-        pop[:, :n_hard] = hard_legal_t
-        pop[:, n_hard:] = soft_anchor + torch.randn(K, n_macros - n_hard, 2, device=device) * 0.1
+        edges_np, weights_np = _build_pair_graph(benchmark)
+        seeds_np = _build_population_seeds(
+            benchmark, K, edges_np, weights_np, sizes_np, movable_np, cw, ch,
+            seed=run_seed,
+        )
+        # Seed 0 is always the legalized initial.plc anchor (full original
+        # soft) — guarantees the safety net is in the population.
+        seeds_np[0, :n_hard] = hard_legal
+        seeds_np[0, n_hard:] = soft_anchor.cpu().numpy()
+        pop = torch.tensor(seeds_np, device=device, dtype=torch.float32)
+        # Snapshot each seed's locked hard layout (these never change during
+        # the gradient step — we'll re-assert per-step so float rounding can't
+        # drift them).
+        hard_locked = pop[:, :n_hard].clone()  # [K, n_hard, 2]
+        # Small soft jitter so identical hard seeds explore slightly different
+        # soft basins.
+        pop[:, n_hard:] = pop[:, n_hard:] + torch.randn(
+            K, n_macros - n_hard, 2, device=device
+        ) * 0.05
         pop.requires_grad_(True)
         opt = torch.optim.Adam([pop], lr=self.soft_lr)
+        self._log(f"  diverse-hard mode: K={K} hard layouts locked in parallel")
 
         n_steps = self.soft_steps
         for step in range(n_steps):
@@ -1157,7 +1180,7 @@ class GraphGradPlacer:
             with torch.no_grad():
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
-                pop[:, :n_hard] = hard_legal_t  # reassert lock
+                pop[:, :n_hard] = hard_locked  # reassert each seed's OWN locked hard
             if self.verbose and (step % max(n_steps // 10, 1) == 0 or step == n_steps - 1):
                 self._log(
                     f"    step {step:>5d}/{n_steps}: "
