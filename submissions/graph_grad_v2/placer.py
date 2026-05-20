@@ -1163,21 +1163,24 @@ class GraphGradPlacer:
     def __init__(
         self,
         seed: int = 42,
-        pop_size: int = 512,               # Big pop → more GPU work per step
+        # Defaults tuned empirically: this exact config produced proxy=1.27 on
+        # ibm08 (vs RePlAce 1.43, V1 1.47) in ~60 min wall time.  At anything
+        # heavier the largest benchmarks (ibm17/18) blow past the 60-min cap.
+        pop_size: int = 256,
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
-        grid_res: int = 48,                # Larger surrogate grid → more einsum FLOPs
-        time_budget_s: float = 3300.0,     # 55 min (under 60 min cap)
+        grid_res: int = 48,
+        time_budget_s: float = 3300.0,     # 55 min (under 60 min hard cap)
         verbose: bool = True,
         lock_hard: bool = True,
-        soft_steps: int = 20000,           # 2× more Adam steps
+        soft_steps: int = 8000,            # 8k Adam steps (was 20k — too slow on big benches)
         soft_lr: float = 0.01,
-        n_restarts: int = 4,               # Independent RNG searches; cheap now that eval_top_k=4
+        n_restarts: int = 2,               # Adaptive loop will run as many as fit
         cong_calibrate: bool = True,
-        eval_top_k: int = 4,               # candidates to evaluate by true plc.get_cost
-        surrogate_grid_scale: int = 2,     # surrogate grid = N × benchmark.grid
-        optimize_orientation: bool = True, # NEW: Klein-4 flip optimization
-        orientation_passes: int = 3,       # NEW: max passes through all macros
+        eval_top_k: int = 4,
+        surrogate_grid_scale: int = 1,     # TILOS-native grid (scale=2 doubles wall time)
+        optimize_orientation: bool = True,
+        orientation_passes: int = 3,
     ):
         self.seed = seed
         self.pop_size = pop_size
