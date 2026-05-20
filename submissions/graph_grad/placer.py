@@ -960,16 +960,17 @@ class GraphGradPlacer:
     def __init__(
         self,
         seed: int = 42,
-        pop_size: int = 96,                # 3× the original to use Blackwell VRAM
+        pop_size: int = 128,               # Scale for Blackwell (97 GB VRAM)
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
         grid_res: int = 32,
-        time_budget_s: float = 3000.0,     # 50 min
+        time_budget_s: float = 3300.0,     # 55 min (under 60 min cap)
         verbose: bool = False,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
-        soft_steps: int = 5000,            # Total Adam steps (was 3000)
+        soft_steps: int = 10000,           # Adam steps per restart (was 5000)
         soft_lr: float = 0.01,
-        n_restarts: int = 1,               # Independent restarts with different RNG seeds
+        n_restarts: int = 3,               # Independent restarts with different RNG seeds
+        cong_calibrate: bool = True,       # NEW: scale RUDY by true_cong/surr_cong at anchor
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -982,6 +983,7 @@ class GraphGradPlacer:
         self.soft_steps = soft_steps
         self.soft_lr = soft_lr
         self.n_restarts = n_restarts
+        self.cong_calibrate = cong_calibrate
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1069,6 +1071,40 @@ class GraphGradPlacer:
             f"device={device}"
         )
 
+        # ── Per-benchmark congestion calibration ──
+        # The RUDY surrogate uses uniform-over-bbox spreading; TILOS's actual
+        # routing concentrates demand on L/T-shape Steiner paths.  Empirically
+        # surrogate ≈ true / ~3.  Compute the ratio once at the anchor and
+        # apply as a multiplier in the loss so the optimizer's congestion
+        # gradient is properly scaled.
+        cong_scale = 1.0
+        plc_setup = _load_plc(benchmark.name)
+        anchor_full_t = torch.zeros(1, n_macros, 2, device=device, dtype=torch.float32)
+        anchor_full_t[0, :n_hard] = hard_legal_t
+        anchor_full_t[0, n_hard:] = soft_anchor
+        anchor_full_clipped = self._clip_soft_to_canvas(
+            anchor_full_t[0].cpu().numpy().astype(np.float64),
+            benchmark, n_hard, cw, ch,
+        )
+        anchor_full_cpu = torch.from_numpy(anchor_full_clipped).float()
+        anchor_cost = None
+        if plc_setup is not None and self.cong_calibrate:
+            anchor_cost = compute_proxy_cost(anchor_full_cpu, benchmark, plc_setup)
+            true_cong = float(anchor_cost["congestion_cost"])
+            with torch.no_grad():
+                surr_cong_anchor = float(
+                    tilos_rudy_normalized(
+                        anchor_full_t, owner_idx, pin_off, net_id, n_nets, port_pos,
+                        n_hard, n_macros, grid_col, grid_row, cw, ch,
+                        h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+                    ).item()
+                )
+            if surr_cong_anchor > 1e-6:
+                cong_scale = true_cong / surr_cong_anchor
+            self._log(
+                f"  cong calibration: true={true_cong:.4f}  surr={surr_cong_anchor:.4f}  scale={cong_scale:.2f}"
+            )
+
         # Population: every seed shares the same locked hard layout;
         # soft starts at initial soft + small jitter.
         K = self.pop_size
@@ -1093,7 +1129,9 @@ class GraphGradPlacer:
                 n_hard, n_macros, grid_col, grid_row, cw, ch,
                 h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
             )
-            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong  # mirrors compute_proxy_cost
+            # Apply per-benchmark congestion calibration so RUDY's contribution
+            # to the loss matches the proxy's true congestion contribution.
+            proxy_surr = wl_n + 0.5 * dens + 0.5 * (cong * cong_scale)
             loss = proxy_surr.sum()
             loss.backward()
             with torch.no_grad():
@@ -1126,8 +1164,8 @@ class GraphGradPlacer:
         k_eval = min(K, max(8, K // 2))
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
 
-        # Cache plc once — each _load_plc reparses the netlist (~seconds)
-        plc = _load_plc(benchmark.name)
+        # Reuse the plc instance from calibration if we computed one.
+        plc = plc_setup if plc_setup is not None else _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
         for k in top_idx:
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
@@ -1139,14 +1177,11 @@ class GraphGradPlacer:
             if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
                 best_cost = c["proxy_cost"]
                 best_full = full_t
-        # Anchor safety net
-        full_anc = torch.zeros(n_macros, 2)
-        full_anc[:n_hard] = hard_legal_t.cpu()
-        full_anc[n_hard:] = soft_anchor.cpu()
-        full_anc_np = full_anc.numpy().astype(np.float64)
-        full_anc_np = self._clip_soft_to_canvas(full_anc_np, benchmark, n_hard, cw, ch)
-        full_anc = torch.from_numpy(full_anc_np).float()
-        c_anc = compute_proxy_cost(full_anc, benchmark, plc) if plc is not None else None
+        # Anchor safety net — reuse cached anchor cost if we computed it
+        full_anc = anchor_full_cpu
+        if anchor_cost is None and plc is not None:
+            anchor_cost = compute_proxy_cost(full_anc, benchmark, plc)
+        c_anc = anchor_cost
         if c_anc is not None and c_anc["proxy_cost"] < best_cost:
             best_cost = c_anc["proxy_cost"]
             best_full = full_anc
