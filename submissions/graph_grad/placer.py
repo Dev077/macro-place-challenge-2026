@@ -960,17 +960,18 @@ class GraphGradPlacer:
     def __init__(
         self,
         seed: int = 42,
-        pop_size: int = 128,               # Scale for Blackwell (97 GB VRAM)
+        pop_size: int = 512,               # Big pop → more GPU work per step
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
-        grid_res: int = 32,
+        grid_res: int = 48,                # Larger surrogate grid → more einsum FLOPs
         time_budget_s: float = 3300.0,     # 55 min (under 60 min cap)
-        verbose: bool = False,
-        lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
-        soft_steps: int = 10000,           # Adam steps per restart (was 5000)
+        verbose: bool = True,
+        lock_hard: bool = True,
+        soft_steps: int = 20000,           # 2× more Adam steps
         soft_lr: float = 0.01,
-        n_restarts: int = 3,               # Independent restarts with different RNG seeds
-        cong_calibrate: bool = True,       # NEW: scale RUDY by true_cong/surr_cong at anchor
+        n_restarts: int = 2,               # Fewer restarts → less CPU eval stall
+        cong_calibrate: bool = True,
+        eval_top_k: int = 4,               # NEW: candidates to evaluate by true plc.get_cost
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -984,6 +985,7 @@ class GraphGradPlacer:
         self.soft_lr = soft_lr
         self.n_restarts = n_restarts
         self.cong_calibrate = cong_calibrate
+        self.eval_top_k = eval_top_k
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1022,19 +1024,22 @@ class GraphGradPlacer:
         Safety net: if no candidate beats the legalized anchor's true proxy,
         the anchor is returned.
         """
+        # Parse the plc ONCE per benchmark; share across all restarts.
+        plc_cached = _load_plc(benchmark.name)
         best_across = None
         best_across_cost = float("inf")
         for r in range(self.n_restarts):
             run_seed = self.seed + 1000 * r
-            full, cost = self._soft_only_single_run(benchmark, run_seed)
+            self._log(f"restart {r+1}/{self.n_restarts} (seed={run_seed})")
+            full, cost = self._soft_only_single_run(benchmark, run_seed, plc_cached)
             if cost < best_across_cost:
                 best_across_cost = cost
                 best_across = full
             if self.verbose and self.n_restarts > 1:
-                self._log(f"restart {r+1}/{self.n_restarts}: proxy={cost:.4f}  best={best_across_cost:.4f}")
+                self._log(f"  → proxy={cost:.4f}  best_so_far={best_across_cost:.4f}")
         return best_across
 
-    def _soft_only_single_run(self, benchmark: Benchmark, run_seed: int):
+    def _soft_only_single_run(self, benchmark: Benchmark, run_seed: int, plc_shared=None):
         """One soft-only optimization run.  Returns (placement_tensor, true_proxy)."""
         from macro_place.objective import compute_proxy_cost
 
@@ -1078,7 +1083,7 @@ class GraphGradPlacer:
         # apply as a multiplier in the loss so the optimizer's congestion
         # gradient is properly scaled.
         cong_scale = 1.0
-        plc_setup = _load_plc(benchmark.name)
+        plc_setup = plc_shared if plc_shared is not None else _load_plc(benchmark.name)
         anchor_full_t = torch.zeros(1, n_macros, 2, device=device, dtype=torch.float32)
         anchor_full_t[0, :n_hard] = hard_legal_t
         anchor_full_t[0, n_hard:] = soft_anchor
@@ -1141,10 +1146,12 @@ class GraphGradPlacer:
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
                 pop[:, :n_hard] = hard_legal_t  # reassert lock
-            if self.verbose and step % max(n_steps // 6, 1) == 0:
+            if self.verbose and (step % max(n_steps // 10, 1) == 0 or step == n_steps - 1):
                 self._log(
-                    f"  step {step}: wl_n={wl_n.mean().item():.4f} "
-                    f"dens={dens.mean().item():.4f} cong={cong.mean().item():.4f} "
+                    f"    step {step:>5d}/{n_steps}: "
+                    f"wl_n={wl_n.mean().item():.4f} "
+                    f"dens={dens.mean().item():.4f} "
+                    f"cong={cong.mean().item():.4f} "
                     f"proxy_surr={proxy_surr.mean().item():.4f}"
                 )
 
@@ -1161,7 +1168,9 @@ class GraphGradPlacer:
                 h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
-        k_eval = min(K, max(8, K // 2))
+        # Eval only the top-K candidates by surrogate via the slow plc.get_cost.
+        # Smaller eval_top_k = less CPU stall, more time on the GPU.
+        k_eval = min(K, max(2, self.eval_top_k))
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
 
         # Reuse the plc instance from calibration if we computed one.
