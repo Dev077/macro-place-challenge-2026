@@ -971,7 +971,8 @@ class GraphGradPlacer:
         soft_lr: float = 0.01,
         n_restarts: int = 4,               # Independent RNG searches; cheap now that eval_top_k=4
         cong_calibrate: bool = True,
-        eval_top_k: int = 4,               # NEW: candidates to evaluate by true plc.get_cost
+        eval_top_k: int = 4,               # candidates to evaluate by true plc.get_cost
+        surrogate_grid_scale: int = 2,     # NEW: surrogate grid = N × benchmark.grid
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -986,6 +987,7 @@ class GraphGradPlacer:
         self.n_restarts = n_restarts
         self.cong_calibrate = cong_calibrate
         self.eval_top_k = eval_top_k
+        self.surrogate_grid_scale = max(1, int(surrogate_grid_scale))
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1064,6 +1066,16 @@ class GraphGradPlacer:
         grid_row = int(benchmark.grid_rows)
         h_per_um = float(benchmark.hroutes_per_micron)
         v_per_um = float(benchmark.vroutes_per_micron)
+        # Surrogate uses a finer grid than TILOS for sharper gradient signal.
+        # Calibration ratio (computed below at TILOS resolution) still aligns
+        # magnitudes — the finer grid just makes density/congestion peaks
+        # more localized in the loss.
+        scale = self.surrogate_grid_scale
+        surr_col = grid_col * scale
+        surr_row = grid_row * scale
+        self._log(
+            f"  surrogate grid: {surr_col}x{surr_row} (TILOS: {grid_col}x{grid_row}, scale={scale})"
+        )
 
         # Legalize hard macros once at initial.plc → anchor.
         init_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64)
@@ -1128,11 +1140,11 @@ class GraphGradPlacer:
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
                 n_hard, n_macros, gamma, cw, ch,
             )
-            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
+            dens = tilos_density_loss(pop, sizes_all, surr_col, surr_row, cw, ch)
             cong = tilos_rudy_normalized(
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, grid_col, grid_row, cw, ch,
-                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+                n_hard, n_macros, surr_col, surr_row, cw, ch,
+                h_per_um, v_per_um, smooth_range=2 * scale, k_frac=0.05,
             )
             # Apply per-benchmark congestion calibration so RUDY's contribution
             # to the loss matches the proxy's true congestion contribution.
@@ -1161,11 +1173,11 @@ class GraphGradPlacer:
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
                 n_hard, n_macros, 0.05, cw, ch,
             )
-            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
+            dens = tilos_density_loss(pop, sizes_all, surr_col, surr_row, cw, ch)
             cong = tilos_rudy_normalized(
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, grid_col, grid_row, cw, ch,
-                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+                n_hard, n_macros, surr_col, surr_row, cw, ch,
+                h_per_um, v_per_um, smooth_range=2 * scale, k_frac=0.05,
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
         # Eval only the top-K candidates by surrogate via the slow plc.get_cost.
