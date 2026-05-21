@@ -1445,7 +1445,7 @@ class LKPlacer:
         # Phase α₁ (electrostatic GP)
         run_gp: bool = True,
         gp_pop_size: int = 4,
-        gp_steps: int = 5000,
+        gp_steps: int = 500,
         gp_budget_s: float = 90.0,
         # Phase α₂ (true-cost subgradient)
         run_alpha2: bool = True,
@@ -1465,6 +1465,9 @@ class LKPlacer:
         regional_min_macros_for_phase: int = 30,
         regional_list_len: int = 60,
         regional_move_radius_frac: float = 0.12,
+        # Phase 4 GPU variant: K parallel chains, batched proxy eval
+        regional_use_gpu: bool = False,
+        regional_n_chains: int = 8,
         # Phase 3 LAHC
         lahc_list_len: int = 100,
         verbose: bool = True,
@@ -1489,6 +1492,8 @@ class LKPlacer:
         self.regional_min_macros_for_phase = regional_min_macros_for_phase
         self.regional_list_len = regional_list_len
         self.regional_move_radius_frac = regional_move_radius_frac
+        self.regional_use_gpu = regional_use_gpu
+        self.regional_n_chains = regional_n_chains
         self.lahc_list_len = lahc_list_len
         self.verbose = verbose
 
@@ -1626,21 +1631,62 @@ class LKPlacer:
             ev.restore(best_pos)
             total_remaining = max(60.0, self.time_budget_s - (time.time() - t0))
             regional_budget = total_remaining * self.regional_budget_frac
-            self._log(
-                f"Phase 4: regional polish  "
-                f"grids={self.regional_grid_sizes}  budget={regional_budget:.0f}s "
-                f"(of {total_remaining:.0f}s remaining)"
-            )
-            out = regional_polish(
-                ev,
-                region_grids=self.regional_grid_sizes,
-                time_budget_s=regional_budget,
-                list_len=self.regional_list_len,
-                move_radius_frac=self.regional_move_radius_frac,
-                seed=self.seed,
-                verbose=self.verbose,
-            )
-            self._log(f"  regional: best fast={out['proxy_cost']:.4f}  iters={out['iters']}  accepted={out['accepted']}")
+            if self.regional_use_gpu:
+                self._log(
+                    f"Phase 4 (GPU): K={self.regional_n_chains} parallel chains  "
+                    f"grids={self.regional_grid_sizes}  budget={regional_budget:.0f}s "
+                    f"(of {total_remaining:.0f}s remaining)"
+                )
+                import importlib.util as _ilu
+                _rg_spec = _ilu.spec_from_file_location(
+                    "lk_placer_regional_gpu",
+                    str(Path(__file__).resolve().parent / "regional_gpu.py"),
+                )
+                _rg = _ilu.module_from_spec(_rg_spec)
+                _rg_spec.loader.exec_module(_rg)
+                # Re-rank chains by the bit-exact CPU FastEvaluator before
+                # picking the winner — the GPU surrogate uses RUDY pin
+                # congestion (not Steiner-tree like the proxy) so ranking
+                # by GPU cost alone can be off.
+                _ranking_ev = ev
+                def _true_proxy_of(pos_np):
+                    _ranking_ev.restore(pos_np)
+                    return _ranking_ev.proxy_cost()["proxy_cost"]
+                best_positions_np, out = _rg.regional_polish_gpu(
+                    benchmark, ev.positions.copy(), plc,
+                    n_chains=self.regional_n_chains,
+                    region_grids=self.regional_grid_sizes,
+                    list_len=self.regional_list_len,
+                    move_radius_frac=self.regional_move_radius_frac,
+                    time_budget_s=regional_budget,
+                    seed=self.seed,
+                    verbose=self.verbose,
+                    rerank_with_true_proxy_cb=_true_proxy_of,
+                )
+                self._log(
+                    f"  regional-gpu: best chain={out['best_chain']} "
+                    f"true_proxy={out['proxy_cost']:.4f}  iters={out['iters']}  "
+                    f"accepted={out['accepted']}\n"
+                    f"               gpu_costs ={[f'{c:.4f}' for c in out['all_chain_costs_gpu']]}\n"
+                    f"               true_costs={[f'{c:.4f}' for c in out['all_chain_costs_true']]}"
+                )
+                ev.restore(best_positions_np)
+            else:
+                self._log(
+                    f"Phase 4: regional polish  "
+                    f"grids={self.regional_grid_sizes}  budget={regional_budget:.0f}s "
+                    f"(of {total_remaining:.0f}s remaining)"
+                )
+                out = regional_polish(
+                    ev,
+                    region_grids=self.regional_grid_sizes,
+                    time_budget_s=regional_budget,
+                    list_len=self.regional_list_len,
+                    move_radius_frac=self.regional_move_radius_frac,
+                    seed=self.seed,
+                    verbose=self.verbose,
+                )
+                self._log(f"  regional: best fast={out['proxy_cost']:.4f}  iters={out['iters']}  accepted={out['accepted']}")
             tc = compute_proxy_cost(torch.from_numpy(ev.positions).float(), benchmark, plc)
             self._log(f"  oracle: {tc['proxy_cost']:.4f}  overlaps={tc['overlap_count']}")
             if tc["overlap_count"] == 0 and tc["proxy_cost"] < best_true:
