@@ -63,6 +63,7 @@ from typing import List, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from macro_place.benchmark import Benchmark
 
@@ -1051,6 +1052,8 @@ class GraphGradPlacer:
 
         self._log(f"Evolutionary Run Setup: n_hard={n_hard} n_soft={n_macros - n_hard}")
 
+        K = self.pop_size
+
         # Build pair graph and generate K diverse starting seeds
         edges, weights = _build_pair_graph(benchmark)
         seeds = _build_population_seeds(
@@ -1070,7 +1073,9 @@ class GraphGradPlacer:
         phase_1_end = int(n_steps * 0.3)
         phase_2_end = int(n_steps * 0.7)
 
-        for step in range(n_steps):
+       step_iterator = tqdm(range(n_steps), desc=f"Adam Steps", disable=not self.verbose)
+
+        for step in step_iterator:
             opt.zero_grad()
             progress = step / max(n_steps, 1)
             gamma = 1.0 * (0.05 ** progress) 
@@ -1154,9 +1159,13 @@ class GraphGradPlacer:
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
 
-            if self.verbose and step % 500 == 0:
-                self._log(f"  step {step}: wl_n={wl_n.mean().item():.4f} dens={dens.mean().item():.4f} cong={cong.mean().item():.4f}")
-
+            if self.verbose and step % 50 == 0:
+                step_iterator.set_postfix({
+                    "wl": f"{wl_n.mean().item():.3f}", 
+                    "dens": f"{dens.mean().item():.3f}", 
+                    "cong": f"{cong.mean().item():.3f}"
+                })
+               
         # Final Evaluation
         with torch.no_grad():
             surr = wl_n + 0.5 * dens + 0.5 * cong
