@@ -960,19 +960,16 @@ class GraphGradPlacer:
     def __init__(
         self,
         seed: int = 42,
-        pop_size: int = 512,               # Big pop → more GPU work per step
+        pop_size: int = 96,                # 3× the original to use Blackwell VRAM
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
-        grid_res: int = 48,                # Larger surrogate grid → more einsum FLOPs
-        time_budget_s: float = 3300.0,     # 55 min (under 60 min cap)
-        verbose: bool = True,
-        lock_hard: bool = True,
-        soft_steps: int = 20000,           # 2× more Adam steps
+        grid_res: int = 32,
+        time_budget_s: float = 3000.0,     # 50 min
+        verbose: bool = False,
+        lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
+        soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
-        n_restarts: int = 4,               # Independent RNG searches; cheap now that eval_top_k=4
-        cong_calibrate: bool = True,
-        eval_top_k: int = 4,               # candidates to evaluate by true plc.get_cost
-        surrogate_grid_scale: int = 2,     # NEW: surrogate grid = N × benchmark.grid
+        n_restarts: int = 1,               # Independent restarts with different RNG seeds
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -985,9 +982,6 @@ class GraphGradPlacer:
         self.soft_steps = soft_steps
         self.soft_lr = soft_lr
         self.n_restarts = n_restarts
-        self.cong_calibrate = cong_calibrate
-        self.eval_top_k = eval_top_k
-        self.surrogate_grid_scale = max(1, int(surrogate_grid_scale))
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1026,62 +1020,19 @@ class GraphGradPlacer:
         Safety net: if no candidate beats the legalized anchor's true proxy,
         the anchor is returned.
         """
-        # Parse the plc ONCE per benchmark; share across all restarts.
-        plc_cached = _load_plc(benchmark.name)
         best_across = None
         best_across_cost = float("inf")
-
-        # ── Time-budget-driven adaptive restarts ──
-        # Run as many independent restarts as fit in self.time_budget_s.
-        # Each restart explores K=pop_size diverse hard layouts with a fresh
-        # RNG seed, so more passes = more independent search.  This uses the
-        # full 55-min/bench budget instead of throwing away the time after a
-        # fixed n_restarts cap.
-        t_start = time.time()
-        t_end = t_start + self.time_budget_s * 0.95  # 5% slack for final assembly
-        t_per_restart_estimate = None
-        n_done = 0
-        hard_cap = max(self.n_restarts, 200)  # safety: never spin forever
-        while n_done < hard_cap:
-            # If we have a runtime estimate, only start a restart that fits
-            if t_per_restart_estimate is not None:
-                if time.time() + t_per_restart_estimate * 1.05 > t_end:
-                    self._log(
-                        f"budget exhausted after {n_done} restarts "
-                        f"(est {t_per_restart_estimate:.0f}s/restart, "
-                        f"{t_end - time.time():.0f}s remaining)"
-                    )
-                    break
-            run_seed = self.seed + 1000 * (n_done + 1)
-            elapsed = time.time() - t_start
-            self._log(
-                f"restart {n_done+1} (seed={run_seed}, elapsed={elapsed:.0f}s, "
-                f"budget={self.time_budget_s:.0f}s)"
-            )
-            t0 = time.time()
-            full, cost = self._soft_only_single_run(benchmark, run_seed, plc_cached)
-            dt = time.time() - t0
-            # Update runtime estimate (slight EMA for stability)
-            if t_per_restart_estimate is None:
-                t_per_restart_estimate = dt
-            else:
-                t_per_restart_estimate = 0.5 * t_per_restart_estimate + 0.5 * dt
-            n_done += 1
+        for r in range(self.n_restarts):
+            run_seed = self.seed + 1000 * r
+            full, cost = self._soft_only_single_run(benchmark, run_seed)
             if cost < best_across_cost:
                 best_across_cost = cost
                 best_across = full
-                self._log(f"  → NEW BEST proxy={cost:.4f}  ({dt:.0f}s)")
-            else:
-                self._log(
-                    f"  → proxy={cost:.4f} (best stays {best_across_cost:.4f}, {dt:.0f}s)"
-                )
-        self._log(
-            f"completed {n_done} restarts in {time.time()-t_start:.0f}s, "
-            f"best proxy={best_across_cost:.4f}"
-        )
+            if self.verbose and self.n_restarts > 1:
+                self._log(f"restart {r+1}/{self.n_restarts}: proxy={cost:.4f}  best={best_across_cost:.4f}")
         return best_across
 
-    def _soft_only_single_run(self, benchmark: Benchmark, run_seed: int, plc_shared=None):
+    def _soft_only_single_run(self, benchmark: Benchmark, run_seed: int):
         """One soft-only optimization run.  Returns (placement_tensor, true_proxy)."""
         from macro_place.objective import compute_proxy_cost
 
@@ -1106,16 +1057,6 @@ class GraphGradPlacer:
         grid_row = int(benchmark.grid_rows)
         h_per_um = float(benchmark.hroutes_per_micron)
         v_per_um = float(benchmark.vroutes_per_micron)
-        # Surrogate uses a finer grid than TILOS for sharper gradient signal.
-        # Calibration ratio (computed below at TILOS resolution) still aligns
-        # magnitudes — the finer grid just makes density/congestion peaks
-        # more localized in the loss.
-        scale = self.surrogate_grid_scale
-        surr_col = grid_col * scale
-        surr_row = grid_row * scale
-        self._log(
-            f"  surrogate grid: {surr_col}x{surr_row} (TILOS: {grid_col}x{grid_row}, scale={scale})"
-        )
 
         # Legalize hard macros once at initial.plc → anchor.
         init_pos = benchmark.macro_positions[:n_hard].numpy().astype(np.float64)
@@ -1128,71 +1069,18 @@ class GraphGradPlacer:
             f"device={device}"
         )
 
-        # ── Per-benchmark congestion calibration ──
-        # The RUDY surrogate uses uniform-over-bbox spreading; TILOS's actual
-        # routing concentrates demand on L/T-shape Steiner paths.  Empirically
-        # surrogate ≈ true / ~3.  Compute the ratio once at the anchor and
-        # apply as a multiplier in the loss so the optimizer's congestion
-        # gradient is properly scaled.
-        cong_scale = 1.0
-        plc_setup = plc_shared if plc_shared is not None else _load_plc(benchmark.name)
-        anchor_full_t = torch.zeros(1, n_macros, 2, device=device, dtype=torch.float32)
-        anchor_full_t[0, :n_hard] = hard_legal_t
-        anchor_full_t[0, n_hard:] = soft_anchor
-        anchor_full_clipped = self._clip_soft_to_canvas(
-            anchor_full_t[0].cpu().numpy().astype(np.float64),
-            benchmark, n_hard, cw, ch,
-        )
-        anchor_full_cpu = torch.from_numpy(anchor_full_clipped).float()
-        anchor_cost = None
-        if plc_setup is not None and self.cong_calibrate:
-            anchor_cost = compute_proxy_cost(anchor_full_cpu, benchmark, plc_setup)
-            true_cong = float(anchor_cost["congestion_cost"])
-            with torch.no_grad():
-                surr_cong_anchor = float(
-                    tilos_rudy_normalized(
-                        anchor_full_t, owner_idx, pin_off, net_id, n_nets, port_pos,
-                        n_hard, n_macros, grid_col, grid_row, cw, ch,
-                        h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
-                    ).item()
-                )
-            if surr_cong_anchor > 1e-6:
-                cong_scale = true_cong / surr_cong_anchor
-            self._log(
-                f"  cong calibration: true={true_cong:.4f}  surr={surr_cong_anchor:.4f}  scale={cong_scale:.2f}"
-            )
-
-        # ── DIVERSE-HARD population ──
-        # Build K seeds via the graph-aware seed builder — each provides its
-        # own legalized hard layout (spectral/Fiedler, force-directed, jittered
-        # initial.plc, etc.).  Each seed's hard arrangement is *locked
-        # independently* — the K members of the population explore K different
-        # hard placements in parallel, each optimizing its own soft macros.
-        # This is the change that lets us escape the initial.plc basin on
-        # benchmarks where it's a suboptimal hard arrangement.
+        # Population: every seed shares the same locked hard layout;
+        # soft starts at initial soft + small jitter.
         K = self.pop_size
-        edges_np, weights_np = _build_pair_graph(benchmark)
-        seeds_np = _build_population_seeds(
-            benchmark, K, edges_np, weights_np, sizes_np, movable_np, cw, ch,
-            seed=run_seed,
-        )
-        # Seed 0 is always the legalized initial.plc anchor (full original
-        # soft) — guarantees the safety net is in the population.
-        seeds_np[0, :n_hard] = hard_legal
-        seeds_np[0, n_hard:] = soft_anchor.cpu().numpy()
-        pop = torch.tensor(seeds_np, device=device, dtype=torch.float32)
-        # Snapshot each seed's locked hard layout (these never change during
-        # the gradient step — we'll re-assert per-step so float rounding can't
-        # drift them).
-        hard_locked = pop[:, :n_hard].clone()  # [K, n_hard, 2]
-        # Small soft jitter so identical hard seeds explore slightly different
-        # soft basins.
-        pop[:, n_hard:] = pop[:, n_hard:] + torch.randn(
-            K, n_macros - n_hard, 2, device=device
-        ) * 0.05
+        pop = torch.zeros(K, n_macros, 2, device=device, dtype=torch.float32)
+        pop[:, :n_hard] = hard_legal_t
+        pop[:, n_hard:] = soft_anchor + torch.randn(K, n_macros - n_hard, 2, device=device) * 0.1
         pop.requires_grad_(True)
         opt = torch.optim.Adam([pop], lr=self.soft_lr)
-        self._log(f"  diverse-hard mode: K={K} hard layouts locked in parallel")
+        enable_branching = True
+        saddle_patience = 100
+        branch_scale = 0.05
+        best_loss_history = []
 
         n_steps = self.soft_steps
         for step in range(n_steps):
@@ -1203,15 +1091,13 @@ class GraphGradPlacer:
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
                 n_hard, n_macros, gamma, cw, ch,
             )
-            dens = tilos_density_loss(pop, sizes_all, surr_col, surr_row, cw, ch)
+            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
             cong = tilos_rudy_normalized(
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, surr_col, surr_row, cw, ch,
-                h_per_um, v_per_um, smooth_range=2 * scale, k_frac=0.05,
+                n_hard, n_macros, grid_col, grid_row, cw, ch,
+                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
             )
-            # Apply per-benchmark congestion calibration so RUDY's contribution
-            # to the loss matches the proxy's true congestion contribution.
-            proxy_surr = wl_n + 0.5 * dens + 0.5 * (cong * cong_scale)
+            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong  # mirrors compute_proxy_cost
             loss = proxy_surr.sum()
             loss.backward()
             with torch.no_grad():
@@ -1220,13 +1106,42 @@ class GraphGradPlacer:
             with torch.no_grad():
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
-                pop[:, :n_hard] = hard_locked  # reassert each seed's OWN locked hard
-            if self.verbose and (step % max(n_steps // 10, 1) == 0 or step == n_steps - 1):
+                pop[:, :n_hard] = hard_legal_t  # reassert lock
+                if enable_branching:
+                    current_best_loss = proxy_surr.min().item()
+                    best_loss_history.append(current_best_loss)
+
+                    if step > saddle_patience and step % 50 == 0:
+                        recent_improvement = best_loss_history[-saddle_patience] - current_best_loss
+
+                        if recent_improvement < 1e-4:
+                            if self.verbose:
+                                self._log(
+                                    f"  [Branching Triggered] Saddle detected at step {step}. Spawning branches."
+                                )
+
+                            best_idx = torch.argmin(proxy_surr)
+                            stuck_layout = pop[best_idx].clone()
+
+                            k_branch = max(1, K // 2)
+                            worst_indices = torch.topk(proxy_surr, k=k_branch).indices
+
+                            branch_noise = torch.randn(
+                                k_branch, n_macros, 2, device=device
+                            ) * branch_scale
+
+                            if self.lock_hard:
+                                branch_noise[:, :n_hard] = 0.0
+
+                            pop[worst_indices] = stuck_layout.unsqueeze(0) + branch_noise
+                            pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
+                            pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
+                            pop[:, :n_hard] = hard_legal_t
+                            branch_scale *= 0.95
+            if self.verbose and step % max(n_steps // 6, 1) == 0:
                 self._log(
-                    f"    step {step:>5d}/{n_steps}: "
-                    f"wl_n={wl_n.mean().item():.4f} "
-                    f"dens={dens.mean().item():.4f} "
-                    f"cong={cong.mean().item():.4f} "
+                    f"  step {step}: wl_n={wl_n.mean().item():.4f} "
+                    f"dens={dens.mean().item():.4f} cong={cong.mean().item():.4f} "
                     f"proxy_surr={proxy_surr.mean().item():.4f}"
                 )
 
@@ -1236,20 +1151,18 @@ class GraphGradPlacer:
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
                 n_hard, n_macros, 0.05, cw, ch,
             )
-            dens = tilos_density_loss(pop, sizes_all, surr_col, surr_row, cw, ch)
+            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
             cong = tilos_rudy_normalized(
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, surr_col, surr_row, cw, ch,
-                h_per_um, v_per_um, smooth_range=2 * scale, k_frac=0.05,
+                n_hard, n_macros, grid_col, grid_row, cw, ch,
+                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
-        # Eval only the top-K candidates by surrogate via the slow plc.get_cost.
-        # Smaller eval_top_k = less CPU stall, more time on the GPU.
-        k_eval = min(K, max(2, self.eval_top_k))
+        k_eval = min(K, max(8, K // 2))
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
 
-        # Reuse the plc instance from calibration if we computed one.
-        plc = plc_setup if plc_setup is not None else _load_plc(benchmark.name)
+        # Cache plc once — each _load_plc reparses the netlist (~seconds)
+        plc = _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
         for k in top_idx:
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
@@ -1261,11 +1174,14 @@ class GraphGradPlacer:
             if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
                 best_cost = c["proxy_cost"]
                 best_full = full_t
-        # Anchor safety net — reuse cached anchor cost if we computed it
-        full_anc = anchor_full_cpu
-        if anchor_cost is None and plc is not None:
-            anchor_cost = compute_proxy_cost(full_anc, benchmark, plc)
-        c_anc = anchor_cost
+        # Anchor safety net
+        full_anc = torch.zeros(n_macros, 2)
+        full_anc[:n_hard] = hard_legal_t.cpu()
+        full_anc[n_hard:] = soft_anchor.cpu()
+        full_anc_np = full_anc.numpy().astype(np.float64)
+        full_anc_np = self._clip_soft_to_canvas(full_anc_np, benchmark, n_hard, cw, ch)
+        full_anc = torch.from_numpy(full_anc_np).float()
+        c_anc = compute_proxy_cost(full_anc, benchmark, plc) if plc is not None else None
         if c_anc is not None and c_anc["proxy_cost"] < best_cost:
             best_cost = c_anc["proxy_cost"]
             best_full = full_anc
@@ -1335,6 +1251,10 @@ class GraphGradPlacer:
         n_anchored = max(2, K // 2)
         for k in range(n_anchored):
             anchor_mask[k] = 1.0 if k == 0 else 0.5
+        enable_branching = True
+        saddle_patience = 100
+        branch_scale = 0.05
+        best_loss_history = []
 
         # TILOS-faithful grid + routing parameters
         grid_col = int(benchmark.grid_cols)
@@ -1392,6 +1312,38 @@ class GraphGradPlacer:
                     pop[..., 1].clamp_(min=half_h_t.unsqueeze(0), max=(ch - half_h_t).unsqueeze(0))
                     if fixed_mask.any():
                         pop[:, fixed_mask] = init_full_t[fixed_mask]
+                    if enable_branching:
+                        current_best_loss = proxy_surr.min().item()
+                        best_loss_history.append(current_best_loss)
+
+                        if step > saddle_patience and step % 50 == 0:
+                            recent_improvement = best_loss_history[-saddle_patience] - current_best_loss
+
+                            if recent_improvement < 1e-4:
+                                if self.verbose:
+                                    self._log(
+                                        f"  [Branching Triggered] Saddle detected at step {step}. Spawning branches."
+                                    )
+
+                                best_idx = torch.argmin(proxy_surr)
+                                stuck_layout = pop[best_idx].clone()
+
+                                k_branch = max(1, K // 2)
+                                worst_indices = torch.topk(proxy_surr, k=k_branch).indices
+
+                                branch_noise = torch.randn(
+                                    k_branch, n_macros, 2, device=device
+                                ) * branch_scale
+
+                                if self.lock_hard:
+                                    branch_noise[:, :n_hard] = 0.0
+
+                                pop[worst_indices] = stuck_layout.unsqueeze(0) + branch_noise
+                                pop[..., 0].clamp_(min=half_w_t.unsqueeze(0), max=(cw - half_w_t).unsqueeze(0))
+                                pop[..., 1].clamp_(min=half_h_t.unsqueeze(0), max=(ch - half_h_t).unsqueeze(0))
+                                if fixed_mask.any():
+                                    pop[:, fixed_mask] = init_full_t[fixed_mask]
+                                branch_scale *= 0.95
 
             # Mid-epoch legalization (only halfway through training, on top-K candidates
             # by surrogate cost — cheap because legalization scales with N²).
