@@ -468,6 +468,150 @@ def _legalize(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# GPU-batched legalize (port of _legalize_spread to torch, K candidates at once)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _legalize_spread_batched_torch(
+    pos: torch.Tensor,        # [K, n, 2] on device
+    sizes: torch.Tensor,      # [n, 2]   on device
+    movable: torch.Tensor,    # [n] bool on device
+    cw: float,
+    ch: float,
+    gap: float = 0.005,
+    max_iters: int = 400,
+    preserve_centroid: bool = True,
+) -> torch.Tensor:
+    """Batched GPU port of _legalize_spread; iterates all K candidates in
+    lockstep with a global early exit when all are overlap-free. Matches the
+    numpy version's update order: push → restore immovables → centroid
+    correction → clamp."""
+    K, n, _ = pos.shape
+    device = pos.device
+    dtype = pos.dtype
+
+    half_w = sizes[:, 0] * 0.5                                # [n]
+    half_h = sizes[:, 1] * 0.5
+    sep_x = (sizes[:, 0:1] + sizes[:, 0:1].T) * 0.5           # [n, n]
+    sep_y = (sizes[:, 1:2] + sizes[:, 1:2].T) * 0.5
+    bmargin = max(gap, 1e-3)
+    safety = max(gap * 0.5, 1e-5)
+    buffer = gap
+
+    lo_x = (half_w + bmargin)
+    hi_x = (cw - half_w - bmargin)
+    lo_y = (half_h + bmargin)
+    hi_y = (ch - half_h - bmargin)
+
+    mov = movable.view(1, n)                                  # [1, n] broadcasts to [K, n]
+    mov3 = mov.unsqueeze(-1)                                  # [1, n, 1]
+    mov_f = movable.to(dtype)                                 # [n]
+    n_mov = mov_f.sum().clamp(min=1.0)
+    diag = torch.eye(n, device=device, dtype=torch.bool)
+
+    out = pos.clone()
+    # Initial clamp on movables; immovables keep pos
+    out_x = torch.minimum(torch.maximum(out[..., 0], lo_x), hi_x)
+    out_y = torch.minimum(torch.maximum(out[..., 1], lo_y), hi_y)
+    out = torch.stack([out_x, out_y], dim=-1)
+    out = torch.where(mov3, out, pos)
+
+    # Per-candidate reference centroid of movables (after initial clamp)
+    ref_centroid = (out * mov_f.view(1, n, 1)).sum(dim=1) / n_mov   # [K, 2]
+
+    for _ in range(max_iters):
+        dx = out[..., 0:1] - out[..., 0:1].transpose(-1, -2)        # [K, n, n]
+        dy = out[..., 1:2] - out[..., 1:2].transpose(-1, -2)
+        absdx = dx.abs()
+        absdy = dy.abs()
+        real_ox = sep_x - absdx                                     # broadcasts to [K, n, n]
+        real_oy = sep_y - absdy
+        overlap = (real_ox + safety > 0) & (real_oy + safety > 0)
+        overlap = overlap & ~diag
+        if not overlap.any():
+            break
+        sign_dx = torch.where(absdx < 1e-9, torch.ones_like(dx), torch.sign(dx))
+        sign_dy = torch.where(absdy < 1e-9, torch.ones_like(dy), torch.sign(dy))
+        push_axis_x = overlap & (real_ox <= real_oy)
+        push_axis_y = overlap & ~push_axis_x
+        zero = torch.zeros_like(dx)
+        contrib_x = torch.where(push_axis_x, sign_dx * (real_ox * 0.5 + buffer), zero)
+        contrib_y = torch.where(push_axis_y, sign_dy * (real_oy * 0.5 + buffer), zero)
+        push_x = contrib_x.sum(dim=-1)                              # [K, n]
+        push_y = contrib_y.sum(dim=-1)
+        # Apply pushes to movables only
+        out_x = out[..., 0] + torch.where(mov, push_x, torch.zeros_like(push_x))
+        out_y = out[..., 1] + torch.where(mov, push_y, torch.zeros_like(push_y))
+        out = torch.stack([out_x, out_y], dim=-1)
+        # Restore immovables to pos
+        out = torch.where(mov3, out, pos)
+        # Centroid pull-back (movables only), damped 0.5
+        if preserve_centroid:
+            new_centroid = (out * mov_f.view(1, n, 1)).sum(dim=1) / n_mov
+            drift = new_centroid - ref_centroid                     # [K, 2]
+            adj = (-0.5 * drift).unsqueeze(1) * mov_f.view(1, n, 1) # [K, n, 2]
+            out = out + adj
+        # Final clamp ALL (numpy clips after centroid; immovables get clipped too)
+        out_x = torch.minimum(torch.maximum(out[..., 0], lo_x), hi_x)
+        out_y = torch.minimum(torch.maximum(out[..., 1], lo_y), hi_y)
+        out = torch.stack([out_x, out_y], dim=-1)
+    return out
+
+
+def _check_legal_batched(
+    pos: torch.Tensor,        # [K, n, 2]
+    sizes: torch.Tensor,      # [n, 2]
+    cw: float,
+    ch: float,
+) -> torch.Tensor:
+    """Per-candidate legality check (no overlap in float32 + in bounds). [K] bool."""
+    K, n, _ = pos.shape
+    device = pos.device
+    half_w = sizes[:, 0] * 0.5
+    half_h = sizes[:, 1] * 0.5
+    sep_x = (sizes[:, 0:1] + sizes[:, 0:1].T) * 0.5
+    sep_y = (sizes[:, 1:2] + sizes[:, 1:2].T) * 0.5
+    absdx = (pos[..., 0:1] - pos[..., 0:1].transpose(-1, -2)).abs()
+    absdy = (pos[..., 1:2] - pos[..., 1:2].transpose(-1, -2)).abs()
+    overlap = (sep_x - absdx > 0) & (sep_y - absdy > 0)
+    diag = torch.eye(n, device=device, dtype=torch.bool)
+    overlap = overlap & ~diag
+    no_overlap = ~overlap.flatten(1).any(dim=1)                     # [K]
+    eps = 1e-6
+    in_x = ((pos[..., 0] - half_w) >= -eps).all(dim=-1) & ((pos[..., 0] + half_w) <= cw + eps).all(dim=-1)
+    in_y = ((pos[..., 1] - half_h) >= -eps).all(dim=-1) & ((pos[..., 1] + half_h) <= ch + eps).all(dim=-1)
+    return no_overlap & in_x & in_y
+
+
+def _legalize_batched(
+    pop_hard_t: torch.Tensor,     # [K, n_hard, 2] on GPU
+    sizes_hard_t: torch.Tensor,   # [n_hard, 2]    on GPU
+    movable_t: torch.Tensor,      # [n_hard] bool  on GPU
+    sizes_np: np.ndarray,         # [n_hard, 2]    on CPU (for spiral fallback)
+    movable_np: np.ndarray,       # [n_hard] bool  on CPU (for spiral fallback)
+    cw: float,
+    ch: float,
+    gap: float = 0.005,
+) -> torch.Tensor:
+    """Batched GPU legalize with per-candidate CPU spiral fallback for failures.
+    Returns a new tensor [K, n_hard, 2] on the same device/dtype as input."""
+    with torch.no_grad():
+        out_t = _legalize_spread_batched_torch(
+            pop_hard_t, sizes_hard_t, movable_t, cw, ch, gap=gap,
+        )
+        legal = _check_legal_batched(out_t, sizes_hard_t, cw, ch)
+        if bool(legal.all()):
+            return out_t
+        # Per-candidate spiral fallback for the few that didn't converge
+        out_np = out_t.detach().cpu().numpy().astype(np.float64)
+        legal_cpu = legal.cpu().numpy()
+        for k in range(out_np.shape[0]):
+            if not legal_cpu[k]:
+                out_np[k] = _legalize_spiral(out_np[k], sizes_np, movable_np, cw, ch, gap=gap)
+        return torch.tensor(out_np, device=out_t.device, dtype=out_t.dtype)
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Differentiable surrogate
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1374,6 +1518,7 @@ class GraphGradPlacer:
         sizes_hard_t = sizes_all[:n_hard]
         sizes_np = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
         movable_np = benchmark.get_movable_mask()[:n_hard].numpy()
+        movable_t = torch.from_numpy(movable_np).to(device)  # bool, [n_hard]
         owner_idx, pin_off, net_id, n_nets = _build_pin_tensors(benchmark, device)
         port_pos = benchmark.port_positions.to(device).float()
         half_w_t = sizes_all[:, 0] / 2
@@ -1400,22 +1545,31 @@ class GraphGradPlacer:
         # (preserved for safety net). Slots 1..n_grid = grid-distributed
         # anti-ring starts. Remaining = jittered initial.plc.  Each candidate's
         # hard layout is also its own anchor for the Phase B pull.
+        # All 96 candidate seeds are built on CPU (cheap) then legalized in one
+        # batched GPU pass with a CPU spiral fallback for non-converged slots.
         K = self.pop_size
         rng_np = np.random.default_rng(run_seed)
         n_grid = max(1, K // 4) if K >= 4 else 0  # 25% of population on grid seeds
-        hard_layouts = np.zeros((K, n_hard, 2), dtype=np.float64)
-        hard_layouts[0] = hard_legal
+        seed_t0 = time.time()
+        hard_layouts_pre = np.zeros((K, n_hard, 2), dtype=np.float64)
+        hard_layouts_pre[0] = hard_legal  # already legal
         for k in range(1, min(1 + n_grid, K)):
-            grid_h = _grid_seeded_hard(sizes_np, cw, ch, seed=run_seed + 17 * k)
-            hard_layouts[k] = _legalize(grid_h, sizes_np, movable_np, cw, ch, gap=0.005)
+            hard_layouts_pre[k] = _grid_seeded_hard(sizes_np, cw, ch, seed=run_seed + 17 * k)
         for k in range(1 + n_grid, K):
             jit_scale = 0.02 + 0.10 * rng_np.random()
             jitter = rng_np.standard_normal((n_hard, 2)) * (min(cw, ch) * jit_scale)
             jitter[~movable_np] = 0.0
-            hard_layouts[k] = _legalize(
-                hard_legal + jitter, sizes_np, movable_np, cw, ch, gap=0.005,
-            )
-        hard_layouts_t = torch.tensor(hard_layouts, device=device, dtype=torch.float32)  # [K, n_hard, 2]
+            hard_layouts_pre[k] = hard_legal + jitter
+        hard_layouts_pre_t = torch.tensor(hard_layouts_pre, device=device, dtype=torch.float32)
+        hard_layouts_t = _legalize_batched(
+            hard_layouts_pre_t, sizes_hard_t, movable_t,
+            sizes_np, movable_np, cw, ch, gap=0.005,
+        )  # [K, n_hard, 2]
+        print(
+            f"[koral] {benchmark.name}: seeded + batched-legalized K={K} candidates "
+            f"in {time.time() - seed_t0:.1f}s",
+            flush=True,
+        )
 
         pop = torch.zeros(K, n_macros, 2, device=device, dtype=torch.float32)
         pop[:, :n_hard] = hard_layouts_t
@@ -1440,6 +1594,25 @@ class GraphGradPlacer:
 
         cell_cong_target = None  # A: lazily initialised inside Phase B
         n_steps = self.soft_steps
+
+        # Plateau early-stop config. Tracks proxy_surr.mean() every
+        # plateau_check_every steps; if no improvement > plateau_min_delta is
+        # seen for plateau_patience consecutive checks within the current
+        # phase, jump Phase A→B early or break out of Phase B. Tracker is
+        # reset at the A→B transition since the loss landscape changes.
+        plateau_check_every = 100
+        plateau_patience = 5
+        plateau_min_delta = 1e-4
+        best_surr_phase = float("inf")
+        plateau_misses = 0
+        phase_transitioned = False
+        print_every = plateau_check_every
+        print(
+            f"[koral] {benchmark.name}: starting soft-only  "
+            f"n_hard={n_hard} n_soft={n_soft} n_nets={n_nets} K={K} "
+            f"max_steps={n_steps} release_step={release_step}",
+            flush=True,
+        )
         for step in range(n_steps):
             opt.zero_grad()
             progress = step / max(n_steps, 1)
@@ -1501,24 +1674,82 @@ class GraphGradPlacer:
                     # Periodic re-legalize during joint phase to prevent overlap accumulation
                     rel_step = step - release_step
                     if rel_step > 0 and rel_step % relegalize_every == 0:
-                        pop_cpu = pop[:, :n_hard].detach().cpu().numpy().astype(np.float64)
-                        for k in range(K):
-                            pop_cpu[k] = _legalize(pop_cpu[k], sizes_np, movable_np, cw, ch, gap=0.005)
-                        pop.data[:, :n_hard] = torch.tensor(pop_cpu, device=device, dtype=torch.float32)
-            if self.verbose and step % max(n_steps // 6, 1) == 0:
-                tag = "JOINT" if in_joint else "soft"
-                self._log(
-                    f"  step {step} [{tag}]: wl_n={wl_n.mean().item():.4f} "
-                    f"dens={dens.mean().item():.4f} cong={cong.mean().item():.4f} "
-                    f"proxy_surr={proxy_surr.mean().item():.4f}"
+                        pop.data[:, :n_hard] = _legalize_batched(
+                            pop[:, :n_hard].detach(),
+                            sizes_hard_t, movable_t,
+                            sizes_np, movable_np, cw, ch, gap=0.005,
+                        )
+            # Progress print + plateau early stop (runs on plateau_check_every).
+            do_print = (step % print_every == 0) or (step == n_steps - 1)
+            if do_print:
+                surr_mean = float(proxy_surr.mean().detach().item())
+                elapsed = time.time() - t_start
+
+                # Phase-transition reset: when we first enter Phase B, the loss
+                # changes (anchor/overlap/pull penalties added) so the running
+                # best is no longer comparable.
+                if in_joint and not phase_transitioned:
+                    best_surr_phase = float("inf")
+                    plateau_misses = 0
+                    phase_transitioned = True
+
+                # Plateau bookkeeping
+                if step == 0:
+                    best_surr_phase = surr_mean
+                else:
+                    if surr_mean < best_surr_phase - plateau_min_delta:
+                        best_surr_phase = surr_mean
+                        plateau_misses = 0
+                    else:
+                        plateau_misses += 1
+
+                rate = (step + 1) / max(elapsed, 1e-3)
+                eta = (n_steps - step - 1) / max(rate, 1e-3)
+                tag = "JOINT" if in_joint else "soft "
+                print(
+                    f"[koral] step {step:>4}/{n_steps} [{tag}] "
+                    f"surr={surr_mean:.4f} best={best_surr_phase:.4f} "
+                    f"miss={plateau_misses}/{plateau_patience}  "
+                    f"wl={wl_n.mean().item():.3f} dens={dens.mean().item():.3f} "
+                    f"cong={cong.mean().item():.3f}  "
+                    f"elapsed={elapsed:.0f}s eta={eta:.0f}s",
+                    flush=True,
                 )
 
+                # Plateau cut.
+                if plateau_misses >= plateau_patience:
+                    if in_joint:
+                        print(
+                            f"[koral] step {step}: Phase B PLATEAU "
+                            f"(no surr improvement in "
+                            f"{plateau_patience * plateau_check_every} steps), "
+                            f"breaking early",
+                            flush=True,
+                        )
+                        break
+                    else:
+                        skip = release_step - (step + 1)
+                        print(
+                            f"[koral] step {step}: Phase A PLATEAU, "
+                            f"jumping to Phase B (skipping {skip} steps)",
+                            flush=True,
+                        )
+                        release_step = step + 1
+                        best_surr_phase = float("inf")
+                        plateau_misses = 0
+
         # Final re-legalize for all candidates (guarantees zero hard overlap).
-        with torch.no_grad():
-            pop_cpu = pop[:, :n_hard].detach().cpu().numpy().astype(np.float64)
-            for k in range(K):
-                pop_cpu[k] = _legalize(pop_cpu[k], sizes_np, movable_np, cw, ch, gap=0.005)
-            pop.data[:, :n_hard] = torch.tensor(pop_cpu, device=device, dtype=torch.float32)
+        final_leg_t0 = time.time()
+        pop.data[:, :n_hard] = _legalize_batched(
+            pop[:, :n_hard].detach(),
+            sizes_hard_t, movable_t,
+            sizes_np, movable_np, cw, ch, gap=0.005,
+        )
+        print(
+            f"[koral] {benchmark.name}: final batched-legalize K={K} in "
+            f"{time.time() - final_leg_t0:.1f}s",
+            flush=True,
+        )
 
         # Rank candidates by surrogate; evaluate top-K' by TRUE proxy.
         with torch.no_grad():
@@ -1535,23 +1766,36 @@ class GraphGradPlacer:
             surr = wl_n + 0.5 * dens + 0.5 * cong
         k_eval = min(K, max(8, K // 2))
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
+        print(
+            f"[koral] {benchmark.name}: ranking done, evaluating top {k_eval}/{K} "
+            f"by true proxy cost (elapsed={time.time()-t_start:.0f}s)",
+            flush=True,
+        )
 
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
         true_costs: List[float] = []
-        for k in top_idx:
+        for i, k in enumerate(top_idx):
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
             pos_full = self._clip_soft_to_canvas(pos_full, benchmark, n_hard, cw, ch)
             full_t = torch.from_numpy(pos_full).float()
             if plc is None:
                 continue
             c = compute_proxy_cost(full_t, benchmark, plc)
+            marker = ""
             if c["overlap_count"] == 0:
                 true_costs.append(float(c["proxy_cost"]))
                 if c["proxy_cost"] < best_cost:
                     best_cost = c["proxy_cost"]
                     best_full = full_t
+                    marker = "  <- new best"
+            print(
+                f"[koral] eval {i+1:>2}/{len(top_idx)} cand={k:>3}: "
+                f"proxy={c['proxy_cost']:.4f} overlap={c['overlap_count']}"
+                f"{marker}",
+                flush=True,
+            )
         if true_costs:
             print(
                 f"[koral release] top_idx true-cost min={min(true_costs):.4f} "
@@ -1573,9 +1817,10 @@ class GraphGradPlacer:
             best_full = full_anc
 
         anchor_str = f"{c_anc['proxy_cost']:.4f}" if c_anc is not None else "NA"
-        self._log(
-            f"soft-only: best true_proxy={best_cost:.4f}  "
-            f"anchor={anchor_str}  time={time.time()-t_start:.1f}s"
+        print(
+            f"[koral] {benchmark.name}: DONE  best_proxy={best_cost:.4f}  "
+            f"anchor={anchor_str}  total_time={time.time()-t_start:.1f}s",
+            flush=True,
         )
         return best_full, best_cost
 
