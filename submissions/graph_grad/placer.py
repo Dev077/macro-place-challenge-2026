@@ -979,9 +979,9 @@ def lahc_polish(
     move_radius_frac: float = 0.06,
     soft_move_radius_frac: float = 0.03,
     soft_centroid_prob: float = 0.50,
-    swap_prob: float = 0.30,
+    swap_prob: float = 0.15,
     soft_prob: float = 0.40,
-    decongest_prob: float = 0.0,         # disabled: didn't outperform random LAHC + LK
+    decongest_prob: float = 0.15,         # disabled: didn't outperform random LAHC + LK
     n_swap_neighbors: int = 12,
     n_decongest_top_cells: int = 16,
     decongest_refresh_every: int = 100,  # recompute hot-cell list every N iters
@@ -1205,7 +1205,7 @@ class LKPlacer:
         run_gp: bool = True,
         gp_pop_size: int = 4,
         gp_steps: int = 500,
-        gp_budget_s: float = 90.0,
+        gp_budget_s: float = 300.0,
         # Phase α₂ (true-cost subgradient)
         run_alpha2: bool = True,
         alpha2_budget_s: float = 60.0,
@@ -1218,7 +1218,7 @@ class LKPlacer:
         cong_attack_passes: int = 3,
         cong_attack_budget_s: float = 60.0,
         # Phase 3 LAHC
-        lahc_list_len: int = 100,
+        lahc_list_len: int = 3500,
         verbose: bool = True,
     ):
         self.seed = seed
