@@ -1445,7 +1445,7 @@ class LKPlacer:
         # Phase α₁ (electrostatic GP)
         run_gp: bool = True,
         gp_pop_size: int = 4,
-        gp_steps: int = 500,
+        gp_steps: int = 5000,
         gp_budget_s: float = 90.0,
         # Phase α₂ (true-cost subgradient)
         run_alpha2: bool = True,
