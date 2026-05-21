@@ -1072,8 +1072,8 @@ class GraphGradPlacer:
         n_steps = self.soft_steps
         phase_1_end = int(n_steps * 0.3)
         phase_2_end = int(n_steps * 0.7)
-
-       step_iterator = tqdm(range(n_steps), desc=f"Adam Steps", disable=not self.verbose)
+        
+        step_iterator = tqdm(range(n_steps), desc=f"Adam Steps", disable=not self.verbose)
 
         for step in step_iterator:
             opt.zero_grad()
