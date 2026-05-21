@@ -1211,8 +1211,8 @@ class LKPlacer:
         alpha2_budget_s: float = 60.0,
         # Phase 2 LK
         lk_passes: int = 3,
-        lk_neighbors: int = 24,
-        lk_chain_depth: int = 4,
+        lk_neighbors: int = 40,
+        lk_chain_depth: int = 5,
         # Phase 2.5 direct congestion attack
         run_cong_attack: bool = False,  # disabled: greedy moves trap LAHC in tighter basin
         cong_attack_passes: int = 3,
