@@ -1466,8 +1466,8 @@ class LKPlacer:
         regional_list_len: int = 60,
         regional_move_radius_frac: float = 0.12,
         # Phase 4 GPU variant: K parallel chains, batched proxy eval
-        regional_use_gpu: bool = False,
-        regional_n_chains: int = 8,
+        regional_use_gpu: bool = True,
+        regional_n_chains: int = 64,
         # Phase 3 LAHC
         lahc_list_len: int = 100,
         verbose: bool = True,
