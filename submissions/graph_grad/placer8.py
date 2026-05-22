@@ -962,7 +962,7 @@ class GraphGradPlacer:
         seed: int = 42,
         pop_size: int = 128,                # 3× the original to use Blackwell VRAM
         n_epochs: int = 10,
-        steps_per_epoch: int = 1000,
+        steps_per_epoch: int = 10000,
         grid_res: int = 64,
         time_budget_s: float = 3000.0,     # 50 min
         verbose: bool = True,
@@ -1012,6 +1012,11 @@ class GraphGradPlacer:
         # Hard-locked soft-only mode (proven sub-anchor on ibm01: 0.886 vs 1.039).
         # See _place_soft_only for the full schedule + safety net.
         t0 = time.time()
+        self._log(
+            f"place: config  lock_hard={self.lock_hard}  n_restarts={self.n_restarts}  "
+            f"pop_size={self.pop_size}  soft_steps={self.soft_steps}  "
+            f"run_lahc={self.run_lahc}"
+        )
         if self.lock_hard:
             koral_positions = self._place_soft_only(benchmark)
         else:
@@ -1134,13 +1139,25 @@ class GraphGradPlacer:
         """
         best_across = None
         best_across_cost = float("inf")
+        self._log(f"_place_soft_only: n_restarts={self.n_restarts}")
         for r in range(self.n_restarts):
             run_seed = self.seed + 1000 * r
-            full, cost = self._soft_only_single_run(benchmark, run_seed)
+            self._log(f"_place_soft_only: starting restart {r+1}/{self.n_restarts}")
+            try:
+                full, cost = self._soft_only_single_run(benchmark, run_seed)
+            except Exception as e:
+                import traceback
+                self._log(f"_place_soft_only: restart {r+1} RAISED: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                full, cost = None, float("inf")
+            self._log(
+                f"_place_soft_only: restart {r+1} returned "
+                f"full={'tensor' if full is not None else 'None'} cost={cost:.4f}"
+            )
             # Always keep the first valid tensor — even if cost is inf (e.g., plc
             # missing and no oracle scoring possible) we still need to return
             # something downstream can consume.
-            if best_across is None or cost < best_across_cost:
+            if full is not None and (best_across is None or cost < best_across_cost):
                 best_across_cost = cost
                 best_across = full
             if self.verbose and self.n_restarts > 1:
