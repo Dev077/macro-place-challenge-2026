@@ -963,7 +963,7 @@ class GraphGradPlacer:
         pop_size: int = 128,                # 3× the original to use Blackwell VRAM
         n_epochs: int = 10,
         steps_per_epoch: int = 10000,
-        grid_res: int = 64,
+        grid_res: int = 32,
         time_budget_s: float = 3000.0,     # 50 min
         verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
@@ -1009,16 +1009,32 @@ class GraphGradPlacer:
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         # Hard-locked soft-only mode (proven sub-anchor on ibm01: 0.886 vs 1.039).
         # See _place_soft_only for the full schedule + safety net.
+        t0 = time.time()
         if self.lock_hard:
             koral_positions = self._place_soft_only(benchmark)
         else:
             koral_positions = self._place_joint(benchmark)
-        # LAHC tail polish (does not alter koral's analytical placement)
+        # LAHC tail polish (does not alter koral's analytical placement).
+        # The total time budget self.time_budget_s is a HARD ceiling on koral +
+        # LAHC combined. LAHC gets `time_budget_s - elapsed - margin`, clamped
+        # to `lahc_min_budget_s` floor so it always runs for at least a minute.
         if self.run_lahc:
-            return self._lahc_tail(benchmark, koral_positions)
+            elapsed = time.time() - t0
+            margin = 30.0  # final oracle + tensor conversion overhead
+            remaining = self.time_budget_s - elapsed - margin
+            self._log(
+                f"place: koral elapsed={elapsed:.1f}s  total_budget={self.time_budget_s:.0f}s  "
+                f"LAHC remaining={remaining:.0f}s (floor={self.lahc_min_budget_s:.0f}s)"
+            )
+            return self._lahc_tail(benchmark, koral_positions, lahc_budget_override=remaining)
         return koral_positions
 
-    def _lahc_tail(self, benchmark: Benchmark, koral_positions: torch.Tensor) -> torch.Tensor:
+    def _lahc_tail(
+        self,
+        benchmark: Benchmark,
+        koral_positions: torch.Tensor,
+        lahc_budget_override: Optional[float] = None,
+    ) -> torch.Tensor:
         """Run LAHC polish on koral's output. Only commits a strictly better,
         zero-overlap result; otherwise returns koral's positions unchanged."""
         from macro_place.objective import compute_proxy_cost
@@ -1055,7 +1071,8 @@ class GraphGradPlacer:
         if drift > 5e-3 and best_cost != float("inf"):
             self._log(f"  WARNING: FastEvaluator/oracle drift={drift:.4f}; LAHC may misrank")
 
-        budget = max(self.lahc_min_budget_s, self.lahc_budget_s)
+        budget_target = lahc_budget_override if lahc_budget_override is not None else self.lahc_budget_s
+        budget = max(self.lahc_min_budget_s, budget_target)
         self._log(f"LAHC tail: polish budget={budget:.0f}s")
         try:
             out = lahc_polish(
