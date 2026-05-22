@@ -496,7 +496,7 @@ class GraphGradPlacer:
         time_budget_s: float = 3300.0,
         verbose: bool = True,
         # Phase α₁ (focused-Poisson GP)
-        gp_pop_size: int = 16,
+        gp_pop_size: int = 8,
         gp_steps: int = 5000,
         gp_budget_s: float = 300.0,
         # Phase α₂ (koral soft-only Adam)
