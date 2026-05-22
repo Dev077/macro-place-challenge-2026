@@ -964,20 +964,24 @@ class GraphGradPlacer:
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
         grid_res: int = 32,
-        time_budget_s: float = 3000.0,     # 50 min
+        time_budget_s: float = 3300.0,     # 55 min: 10 min koral + 45 min LAHC + margin
         verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
-        n_restarts: int = 1,               # Independent restarts with different RNG seeds
+        n_restarts: int = 0,               # Independent restarts with different RNG seeds
         # LAHC tail stage (runs after analytical placement; bit-exact incremental
         # proxy via FastEvaluator). Does NOT change koral's placement process —
         # it only polishes the result. Disable with run_lahc=False.
         run_lahc: bool = True,
         lahc_budget_s: float = 2700.0,     # remaining budget after koral
         lahc_list_len: int = 100,
-        lahc_min_budget_s: float = 60.0,
+        lahc_min_budget_s: float = 2700.0, # hard floor: 45 min minimum for LAHC
         lahc_log_interval_s: float = 15.0,
+        # Hard cap on the koral stage (Adam loop + top-K scoring + anchor check).
+        # When this is hit, koral aborts whatever stage it's in and hands off
+        # to LAHC. Default 10 min ensures LAHC always gets ≥45 min.
+        koral_max_budget_s: float = 600.0,
         # Top-K oracle scoring early-exit: stop scoring candidates once we've
         # had `koral_scoring_plateau_threshold` consecutive scores without
         # improvement. Floor of `koral_scoring_min_candidates` always scored.
@@ -1004,9 +1008,12 @@ class GraphGradPlacer:
         self.lahc_list_len = lahc_list_len
         self.lahc_min_budget_s = lahc_min_budget_s
         self.lahc_log_interval_s = lahc_log_interval_s
+        self.koral_max_budget_s = koral_max_budget_s
         self.koral_scoring_plateau_threshold = koral_scoring_plateau_threshold
         self.koral_scoring_min_candidates = koral_scoring_min_candidates
         self.koral_k_eval = koral_k_eval
+        # Filled in by place(); used by inner loops as a hard wall-clock deadline.
+        self._koral_deadline: Optional[float] = None
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1024,10 +1031,12 @@ class GraphGradPlacer:
         # Hard-locked soft-only mode (proven sub-anchor on ibm01: 0.886 vs 1.039).
         # See _place_soft_only for the full schedule + safety net.
         t0 = time.time()
+        # Hard wall-clock deadline for the entire koral stage.
+        self._koral_deadline = t0 + self.koral_max_budget_s
         self._log(
             f"place: config  lock_hard={self.lock_hard}  n_restarts={self.n_restarts}  "
             f"pop_size={self.pop_size}  soft_steps={self.soft_steps}  "
-            f"run_lahc={self.run_lahc}"
+            f"run_lahc={self.run_lahc}  koral_max={self.koral_max_budget_s:.0f}s"
         )
         if self.lock_hard:
             koral_positions = self._place_soft_only(benchmark)
@@ -1236,7 +1245,19 @@ class GraphGradPlacer:
         opt = torch.optim.Adam([pop], lr=self.soft_lr)
 
         n_steps = self.soft_steps
+        # Reserve ~10% of the koral budget for top-K scoring + anchor check.
+        adam_deadline = (
+            self._koral_deadline - 0.10 * self.koral_max_budget_s
+            if self._koral_deadline is not None else None
+        )
         for step in range(n_steps):
+            # Hard wall-clock check: bail early if the koral budget is almost up.
+            if adam_deadline is not None and time.time() >= adam_deadline:
+                self._log(
+                    f"  Adam deadline hit at step {step}/{n_steps} "
+                    f"(reserving rest of koral budget for top-K scoring)"
+                )
+                break
             opt.zero_grad()
             progress = step / max(n_steps, 1)
             gamma = 1.0 * (0.05 ** progress)  # WAHPWL smoothing → sharp Manhattan HPWL
@@ -1326,6 +1347,13 @@ class GraphGradPlacer:
                     f"  plateau: {no_improve} non-improving candidates in a row; "
                     f"stopping early at {scored_total}/{len(top_idx)} "
                     f"(saved ~{(len(top_idx)-scored_total)*((time.time()-_score_t0)/scored_total):.0f}s)"
+                )
+                break
+            # Hard wall-clock check: respect the koral budget ceiling.
+            if self._koral_deadline is not None and time.time() >= self._koral_deadline:
+                self._log(
+                    f"  koral deadline hit during scoring at {scored_total}/{len(top_idx)}; "
+                    f"handing off to LAHC"
                 )
                 break
         # Anchor safety net
