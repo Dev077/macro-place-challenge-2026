@@ -464,7 +464,7 @@ def _clip_soft_to_canvas(
 
 
 def _lk_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "lk_placer"
+    return Path(__file__).resolve().parent
 
 
 def _load_lk_gp():
