@@ -493,12 +493,12 @@ class GraphGradPlacer:
     def __init__(
         self,
         seed: int = 42,
-        time_budget_s: float = 800.0,
+        time_budget_s: float = 3000.0,
         verbose: bool = True,
         # Phase α₁ (focused-Poisson GP)
-        gp_pop_size: int = 4,
-        gp_steps: int = 300,
-        gp_budget_s: float = 60.0,
+        gp_pop_size: int = 8,
+        gp_steps: int = 5000,
+        gp_budget_s: float = 300.0,
         # Phase α₂ (koral soft-only Adam)
         run_soft_adam: bool = True,
         soft_K: int = 24,
@@ -507,7 +507,7 @@ class GraphGradPlacer:
         soft_budget_s: float = 220.0,
         # Phase 2 — α₂ true-cost subgradient
         run_subgrad: bool = True,
-        subgrad_budget_s: float = 60.0,
+        subgrad_budget_s: float = 100.0,
         # Phase 3 — LK k-opt
         run_lk: bool = True,
         lk_passes: int = 2,
