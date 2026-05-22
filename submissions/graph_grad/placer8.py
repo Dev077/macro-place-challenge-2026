@@ -965,7 +965,7 @@ class GraphGradPlacer:
         steps_per_epoch: int = 5000,
         grid_res: int = 64,
         time_budget_s: float = 3000.0,     # 50 min
-        verbose: bool = False,
+        verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
         soft_steps: int = 10000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
