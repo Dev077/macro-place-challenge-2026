@@ -493,7 +493,7 @@ class GraphGradPlacer:
     def __init__(
         self,
         seed: int = 42,
-        time_budget_s: float = 3000.0,
+        time_budget_s: float = 3300.0,
         verbose: bool = True,
         # Phase α₁ (focused-Poisson GP)
         gp_pop_size: int = 16,
