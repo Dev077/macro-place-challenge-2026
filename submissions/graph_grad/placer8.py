@@ -962,8 +962,8 @@ class GraphGradPlacer:
         seed: int = 42,
         pop_size: int = 128,                # 3× the original to use Blackwell VRAM
         n_epochs: int = 10,
-        steps_per_epoch: int = 10000,
-        grid_res: int = 32,
+        steps_per_epoch: int = 1000,
+        grid_res: int = 64,
         time_budget_s: float = 3000.0,     # 50 min
         verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
@@ -977,6 +977,7 @@ class GraphGradPlacer:
         lahc_budget_s: float = 2700.0,     # remaining budget after koral
         lahc_list_len: int = 100,
         lahc_min_budget_s: float = 60.0,
+        lahc_log_interval_s: float = 15.0,
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -993,6 +994,7 @@ class GraphGradPlacer:
         self.lahc_budget_s = lahc_budget_s
         self.lahc_list_len = lahc_list_len
         self.lahc_min_budget_s = lahc_min_budget_s
+        self.lahc_log_interval_s = lahc_log_interval_s
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1040,6 +1042,11 @@ class GraphGradPlacer:
         from macro_place.objective import compute_proxy_cost
 
         t0 = time.time()
+        # Guard: if koral returned None for any reason, fall back to initial.plc
+        if koral_positions is None:
+            self._log("LAHC tail: koral returned None; using initial.plc as fallback")
+            koral_positions = benchmark.macro_positions.clone().float()
+
         plc = _load_plc(benchmark.name)
         if plc is None:
             self._log("LAHC tail: plc=None; skipping (FastEvaluator requires plc)")
@@ -1081,6 +1088,7 @@ class GraphGradPlacer:
                 time_budget_s=budget,
                 seed=self.seed,
                 verbose=self.verbose,
+                log_interval_s=self.lahc_log_interval_s,
             )
             self._log(f"LAHC tail done: fast_best={out['proxy_cost']:.4f} iters={out['iters']}")
         except Exception as e:
@@ -1129,11 +1137,19 @@ class GraphGradPlacer:
         for r in range(self.n_restarts):
             run_seed = self.seed + 1000 * r
             full, cost = self._soft_only_single_run(benchmark, run_seed)
-            if cost < best_across_cost:
+            # Always keep the first valid tensor — even if cost is inf (e.g., plc
+            # missing and no oracle scoring possible) we still need to return
+            # something downstream can consume.
+            if best_across is None or cost < best_across_cost:
                 best_across_cost = cost
                 best_across = full
             if self.verbose and self.n_restarts > 1:
                 self._log(f"restart {r+1}/{self.n_restarts}: proxy={cost:.4f}  best={best_across_cost:.4f}")
+        # Final fallback: legalized initial.plc anchor (should be unreachable but
+        # guards against future regressions where every restart returns None).
+        if best_across is None:
+            self._log("WARNING: all restarts returned None; falling back to initial.plc")
+            best_across = benchmark.macro_positions.clone().float()
         return best_across
 
     def _soft_only_single_run(self, benchmark: Benchmark, run_seed: int):
@@ -2028,6 +2044,7 @@ def lahc_polish(
     decongest_refresh_every: int = 100,  # recompute hot-cell list every N iters
     seed: int = 0,
     verbose: bool = True,
+    log_interval_s: float = 20.0,
 ):
     rng = np.random.default_rng(seed)
     cur_cost = ev.proxy_cost()["proxy_cost"]
@@ -2042,7 +2059,7 @@ def lahc_polish(
     hot_macros: List[int] = []                       # macros contributing to hot cells
     last_hot_refresh = -1
     while time.time() - t0 < time_budget_s:
-        if verbose and time.time() - last_log > 20.0:
+        if verbose and time.time() - last_log >= log_interval_s:
             print(f"  [LAHC] t={time.time()-t0:.0f}s it={it} cur={cur_cost:.4f} best={best_cost:.4f}", flush=True)
             last_log = time.time()
         # Periodically refresh the hot-cell list and the macros contributing to them
