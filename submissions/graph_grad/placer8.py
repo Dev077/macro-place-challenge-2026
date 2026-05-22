@@ -1139,10 +1139,13 @@ class GraphGradPlacer:
         """
         best_across = None
         best_across_cost = float("inf")
-        self._log(f"_place_soft_only: n_restarts={self.n_restarts}")
-        for r in range(self.n_restarts):
+        # n_restarts means "extra restarts beyond the first run", so always do
+        # at least one pass. n_restarts=0 → 1 run; n_restarts=2 → 2 runs; etc.
+        n_runs = max(1, self.n_restarts)
+        self._log(f"_place_soft_only: n_restarts={self.n_restarts} → n_runs={n_runs}")
+        for r in range(n_runs):
             run_seed = self.seed + 1000 * r
-            self._log(f"_place_soft_only: starting restart {r+1}/{self.n_restarts}")
+            self._log(f"_place_soft_only: starting run {r+1}/{n_runs}")
             try:
                 full, cost = self._soft_only_single_run(benchmark, run_seed)
             except Exception as e:
@@ -1160,8 +1163,8 @@ class GraphGradPlacer:
             if full is not None and (best_across is None or cost < best_across_cost):
                 best_across_cost = cost
                 best_across = full
-            if self.verbose and self.n_restarts > 1:
-                self._log(f"restart {r+1}/{self.n_restarts}: proxy={cost:.4f}  best={best_across_cost:.4f}")
+            if self.verbose and n_runs > 1:
+                self._log(f"run {r+1}/{n_runs}: proxy={cost:.4f}  best={best_across_cost:.4f}")
         # Final fallback: legalized initial.plc anchor (should be unreachable but
         # guards against future regressions where every restart returns None).
         if best_across is None:
