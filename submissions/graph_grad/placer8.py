@@ -1017,7 +1017,7 @@ class GraphGradPlacer:
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
-        n_restarts: int = 0,               # Independent restarts with different RNG seeds
+        n_restarts: int = 1,               # Independent restarts with different RNG seeds
         # LAHC tail stage (runs after analytical placement; bit-exact incremental
         # proxy via FastEvaluator). Does NOT change koral's placement process —
         # it only polishes the result. Disable with run_lahc=False.
@@ -1028,8 +1028,8 @@ class GraphGradPlacer:
         lahc_log_interval_s: float = 15.0,
         # Hard cap on the koral stage (Adam loop + top-K scoring + anchor check).
         # When this is hit, koral aborts whatever stage it's in and hands off
-        # to LAHC. Default 10 min ensures LAHC always gets ≥45 min.
-        koral_max_budget_s: float = 600.0,
+        # to LAHC. Default 7 min ensures LAHC always gets ≥47 min.
+        koral_max_budget_s: float = 420.0,
         # Cap on the top-K candidates scored against the oracle in soft-only
         # mode. Scoring also stops when the koral wall-clock deadline hits.
         # Lower = faster (each oracle call is 5-15s on big designs).
