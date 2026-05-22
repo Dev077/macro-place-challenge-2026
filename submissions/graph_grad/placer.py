@@ -1171,6 +1171,247 @@ def lahc_polish(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Phase 4 — Hierarchical Regional Polish
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _region_heat(ev: FastEvaluator, cong: np.ndarray, R: int) -> np.ndarray:
+    """Aggregate the fine smoothed-congestion grid into an R×R region heat map."""
+    rw = ev.cw / R
+    rh = ev.ch / R
+    cell_ci = np.clip(((np.arange(ev.grid_col) + 0.5) * ev.gw / rw).astype(int), 0, R - 1)
+    cell_ri = np.clip(((np.arange(ev.grid_row) + 0.5) * ev.gh / rh).astype(int), 0, R - 1)
+    heat = np.zeros((R, R), dtype=np.float64)
+    for r in range(ev.grid_row):
+        ri = int(cell_ri[r])
+        for c in range(ev.grid_col):
+            heat[ri, int(cell_ci[c])] += cong[r, c]
+    return heat
+
+
+def _macros_in_region(
+    ev: FastEvaluator,
+    x0: float, y0: float, x1: float, y1: float,
+) -> Tuple[List[int], List[int]]:
+    """Return (hard_idx, soft_idx) of movable macros whose centers lie in [x0,x1)×[y0,y1)."""
+    hard, soft = [], []
+    pos = ev.positions
+    for m in range(ev.n_macros):
+        if not ev.movable[m]:
+            continue
+        px, py = pos[m]
+        if x0 <= px < x1 and y0 <= py < y1:
+            if m < ev.n_hard:
+                hard.append(m)
+            else:
+                soft.append(m)
+    return hard, soft
+
+
+def local_lahc(
+    ev: FastEvaluator,
+    hard_idx: List[int],
+    soft_idx: List[int],
+    list_len: int,
+    time_budget_s: float,
+    move_radius_frac: float,
+    soft_move_radius_frac: float,
+    soft_centroid_prob: float,
+    swap_prob: float,
+    soft_prob: float,
+    n_swap_neighbors: int,
+    rng: np.random.Generator,
+) -> Tuple[int, int]:
+    """Mini-LAHC restricted to a given set of macro indices (frozen exterior).
+
+    Move proposals only pick from `hard_idx` ∪ `soft_idx`; swap partners come
+    from `hard_idx` only.  Acceptance uses the *global* proxy_cost — guarantees
+    no globally regressive move is accepted, so the frozen-exterior contract
+    is enforced without explicit per-region cost.
+    """
+    n_h = len(hard_idx)
+    n_s = len(soft_idx)
+    if n_h == 0 and n_s == 0:
+        return 0, 0
+    cur_cost = ev.proxy_cost()["proxy_cost"]
+    history = [cur_cost] * list_len
+    t0 = time.time()
+    it = 0
+    accepted = 0
+    hard_arr = np.array(hard_idx, dtype=np.int64) if n_h else None
+    while time.time() - t0 < time_budget_s:
+        r = rng.random()
+        do_swap = (r < swap_prob) and (n_h >= 2)
+        do_soft = (not do_swap) and (r < swap_prob + soft_prob) and (n_s > 0)
+        if do_swap:
+            i = int(hard_arr[int(rng.integers(0, n_h))])
+            d = np.linalg.norm(ev.positions[hard_arr] - ev.positions[i], axis=1)
+            # mask self
+            mask = hard_arr != i
+            cand_arr = hard_arr[mask]
+            d_arr = d[mask]
+            if cand_arr.size == 0:
+                it += 1
+                continue
+            k = min(n_swap_neighbors, cand_arr.size)
+            nbrs = cand_arr[np.argsort(d_arr)[:k]]
+            j = int(nbrs[int(rng.integers(0, nbrs.size))])
+            if not _swap_legal(ev, i, j):
+                it += 1
+                continue
+            ev.swap_macros(i, j)
+            cand = ev.proxy_cost()["proxy_cost"]
+            idx_h = it % list_len
+            if cand < cur_cost or cand < history[idx_h]:
+                cur_cost = cand
+                history[idx_h] = cand
+                accepted += 1
+            else:
+                ev.swap_macros(i, j)
+        elif do_soft:
+            i = int(soft_idx[int(rng.integers(0, n_s))])
+            ox, oy = ev.positions[i]
+            use_cent = rng.random() < soft_centroid_prob
+            if use_cent:
+                tgt = _soft_centroid_target(ev, i)
+                if tgt is None:
+                    it += 1
+                    continue
+                tx, ty = tgt
+                f = float(rng.uniform(0.05, 0.5))
+                nx = ox + f * (tx - ox)
+                ny = oy + f * (ty - oy)
+            else:
+                rx = soft_move_radius_frac * ev.cw
+                ry = soft_move_radius_frac * ev.ch
+                nx = ox + float(rng.uniform(-rx, rx))
+                ny = oy + float(rng.uniform(-ry, ry))
+            nx = max(ev.half[i, 0], min(ev.cw - ev.half[i, 0], nx))
+            ny = max(ev.half[i, 1], min(ev.ch - ev.half[i, 1], ny))
+            ev.move_macro(i, nx, ny, is_hard=False)
+            cand = ev.proxy_cost()["proxy_cost"]
+            idx_h = it % list_len
+            if cand < cur_cost or cand < history[idx_h]:
+                cur_cost = cand
+                history[idx_h] = cand
+                accepted += 1
+            else:
+                ev.move_macro(i, ox, oy, is_hard=False)
+        elif n_h > 0:
+            i = int(hard_arr[int(rng.integers(0, n_h))])
+            rx = move_radius_frac * ev.cw
+            ry = move_radius_frac * ev.ch
+            ox, oy = ev.positions[i]
+            nx = max(ev.half[i, 0], min(ev.cw - ev.half[i, 0], ox + float(rng.uniform(-rx, rx))))
+            ny = max(ev.half[i, 1], min(ev.ch - ev.half[i, 1], oy + float(rng.uniform(-ry, ry))))
+            if not _slide_legal(ev, i, nx, ny):
+                it += 1
+                continue
+            ev.move_macro(i, nx, ny, is_hard=True)
+            cand = ev.proxy_cost()["proxy_cost"]
+            idx_h = it % list_len
+            if cand < cur_cost or cand < history[idx_h]:
+                cur_cost = cand
+                history[idx_h] = cand
+                accepted += 1
+            else:
+                ev.move_macro(i, ox, oy, is_hard=True)
+        it += 1
+    return it, accepted
+
+
+def regional_polish(
+    ev: FastEvaluator,
+    region_grids: Tuple[int, ...] = (3, 5, 7),
+    time_budget_s: float = 300.0,
+    list_len: int = 60,
+    move_radius_frac: float = 0.12,
+    soft_move_radius_frac: float = 0.06,
+    soft_centroid_prob: float = 0.50,
+    swap_prob: float = 0.30,
+    soft_prob: float = 0.40,
+    n_swap_neighbors: int = 8,
+    min_macros_per_region: int = 3,
+    seed: int = 0,
+    verbose: bool = True,
+):
+    """Hierarchical region-based polish.
+
+    For each grid size R in `region_grids`, partition the canvas into an R×R
+    set of regions, then visit regions in descending congestion order.  Each
+    region runs a focused mini-LAHC restricted to the movable macros whose
+    centers fall in that region — exterior macros stay frozen.  The
+    per-region subproblem has many fewer DOFs, so the mini-LAHC can afford a
+    larger move radius and reach configurations a global LAHC pass would
+    almost never sample.
+
+    Progressive grids (3 → 5 → 7) refine from coarse multi-region clusters
+    to tight local pockets.
+    """
+    rng = np.random.default_rng(seed)
+    cur_cost = ev.proxy_cost()["proxy_cost"]
+    best_cost = cur_cost
+    best_pos = ev.positions.copy()
+    t0 = time.time()
+    total_iters = 0
+    total_accepted = 0
+    for sweep_idx, R in enumerate(region_grids):
+        if time.time() - t0 >= time_budget_s:
+            break
+        rw = ev.cw / R
+        rh = ev.ch / R
+        cong = _smoothed_congestion_grid(ev)
+        heat = _region_heat(ev, cong, R)
+        order = sorted(
+            [(int(ri), int(ci)) for ri in range(R) for ci in range(R)],
+            key=lambda x: -heat[x[0], x[1]],
+        )
+        sweeps_left = len(region_grids) - sweep_idx
+        time_left = time_budget_s - (time.time() - t0)
+        sweep_budget = time_left / sweeps_left
+        per_region_budget = max(2.0, sweep_budget / (R * R))
+        regions_done = 0
+        for (ri, ci) in order:
+            if time.time() - t0 >= time_budget_s:
+                break
+            x0, x1 = ci * rw, (ci + 1) * rw
+            y0, y1 = ri * rh, (ri + 1) * rh
+            hard_in, soft_in = _macros_in_region(ev, x0, y0, x1, y1)
+            if len(hard_in) + len(soft_in) < min_macros_per_region:
+                continue
+            it, acc = local_lahc(
+                ev, hard_in, soft_in,
+                list_len=list_len,
+                time_budget_s=per_region_budget,
+                move_radius_frac=move_radius_frac,
+                soft_move_radius_frac=soft_move_radius_frac,
+                soft_centroid_prob=soft_centroid_prob,
+                swap_prob=swap_prob,
+                soft_prob=soft_prob,
+                n_swap_neighbors=n_swap_neighbors,
+                rng=rng,
+            )
+            total_iters += it
+            total_accepted += acc
+            new_c = ev.proxy_cost()["proxy_cost"]
+            if new_c < best_cost:
+                best_cost = new_c
+                best_pos = ev.positions.copy()
+            cur_cost = new_c
+            regions_done += 1
+        if verbose:
+            print(
+                f"  [REGIONAL] sweep {sweep_idx+1}/{len(region_grids)} R={R}  "
+                f"regions={regions_done}/{R*R}  iters={total_iters}  "
+                f"accepted={total_accepted}  cur={cur_cost:.4f}  best={best_cost:.4f}",
+                flush=True,
+            )
+    if not np.array_equal(ev.positions, best_pos):
+        ev.restore(best_pos)
+    return {"proxy_cost": best_cost, "iters": total_iters, "accepted": total_accepted}
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # LKPlacer orchestrator
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1200,25 +1441,35 @@ class LKPlacer:
     def __init__(
         self,
         seed: int = 42,
-        time_budget_s: float = 3300.0,
+        time_budget_s: float = 3000.0,
         # Phase α₁ (electrostatic GP)
         run_gp: bool = True,
-        gp_pop_size: int = 8,
-        gp_steps: int = 8000,
-        gp_budget_s: float = 300.0,
+        gp_pop_size: int = 4,
+        gp_steps: int = 500,
+        gp_budget_s: float = 90.0,
         # Phase α₂ (true-cost subgradient)
         run_alpha2: bool = True,
-        alpha2_budget_s: float = 150.0,
+        alpha2_budget_s: float = 60.0,
         # Phase 2 LK
         lk_passes: int = 3,
-        lk_neighbors: int = 36,
-        lk_chain_depth: int = 6,
+        lk_neighbors: int = 24,
+        lk_chain_depth: int = 4,
         # Phase 2.5 direct congestion attack
         run_cong_attack: bool = False,  # disabled: greedy moves trap LAHC in tighter basin
         cong_attack_passes: int = 3,
         cong_attack_budget_s: float = 60.0,
+        # Phase 4 hierarchical regional polish
+        run_regional: bool = True,
+        regional_grid_sizes: Tuple[int, ...] = (3, 5, 7),
+        regional_budget_frac: float = 0.45,
+        regional_min_macros_for_phase: int = 30,
+        regional_list_len: int = 60,
+        regional_move_radius_frac: float = 0.12,
+        # Phase 4 GPU variant: K parallel chains, batched proxy eval
+        regional_use_gpu: bool = False,
+        regional_n_chains: int = 8,
         # Phase 3 LAHC
-        lahc_list_len: int = 150,
+        lahc_list_len: int = 100,
         verbose: bool = True,
     ):
         self.seed = seed
@@ -1235,6 +1486,14 @@ class LKPlacer:
         self.run_cong_attack = run_cong_attack
         self.cong_attack_passes = cong_attack_passes
         self.cong_attack_budget_s = cong_attack_budget_s
+        self.run_regional = run_regional
+        self.regional_grid_sizes = tuple(regional_grid_sizes)
+        self.regional_budget_frac = regional_budget_frac
+        self.regional_min_macros_for_phase = regional_min_macros_for_phase
+        self.regional_list_len = regional_list_len
+        self.regional_move_radius_frac = regional_move_radius_frac
+        self.regional_use_gpu = regional_use_gpu
+        self.regional_n_chains = regional_n_chains
         self.lahc_list_len = lahc_list_len
         self.verbose = verbose
 
@@ -1351,6 +1610,83 @@ class LKPlacer:
                 verbose=self.verbose,
             )
             self._log(f"  cong-attack: improvement={out['improvement']:+.4f} accepted={out['accepted']}")
+            tc = compute_proxy_cost(torch.from_numpy(ev.positions).float(), benchmark, plc)
+            self._log(f"  oracle: {tc['proxy_cost']:.4f}  overlaps={tc['overlap_count']}")
+            if tc["overlap_count"] == 0 and tc["proxy_cost"] < best_true:
+                best_true = float(tc["proxy_cost"])
+                best_pos = ev.positions.copy()
+            elif best_pos is not None:
+                ev.restore(best_pos)
+
+        # ── Phase 4 — Hierarchical Regional Polish ──
+        # Runs before LAHC: gives LAHC a better starting point by doing
+        # region-by-region focused optimization that single-macro LAHC moves
+        # cannot do.  Disabled automatically for small designs where LAHC
+        # already explores the full space efficiently.
+        if (
+            self.run_regional
+            and best_pos is not None
+            and ev.n_hard >= self.regional_min_macros_for_phase
+        ):
+            ev.restore(best_pos)
+            total_remaining = max(60.0, self.time_budget_s - (time.time() - t0))
+            regional_budget = total_remaining * self.regional_budget_frac
+            if self.regional_use_gpu:
+                self._log(
+                    f"Phase 4 (GPU): K={self.regional_n_chains} parallel chains  "
+                    f"grids={self.regional_grid_sizes}  budget={regional_budget:.0f}s "
+                    f"(of {total_remaining:.0f}s remaining)"
+                )
+                import importlib.util as _ilu
+                _rg_spec = _ilu.spec_from_file_location(
+                    "lk_placer_regional_gpu",
+                    str(Path(__file__).resolve().parent / "regional_gpu.py"),
+                )
+                _rg = _ilu.module_from_spec(_rg_spec)
+                _rg_spec.loader.exec_module(_rg)
+                # Re-rank chains by the bit-exact CPU FastEvaluator before
+                # picking the winner — the GPU surrogate uses RUDY pin
+                # congestion (not Steiner-tree like the proxy) so ranking
+                # by GPU cost alone can be off.
+                _ranking_ev = ev
+                def _true_proxy_of(pos_np):
+                    _ranking_ev.restore(pos_np)
+                    return _ranking_ev.proxy_cost()["proxy_cost"]
+                best_positions_np, out = _rg.regional_polish_gpu(
+                    benchmark, ev.positions.copy(), plc,
+                    n_chains=self.regional_n_chains,
+                    region_grids=self.regional_grid_sizes,
+                    list_len=self.regional_list_len,
+                    move_radius_frac=self.regional_move_radius_frac,
+                    time_budget_s=regional_budget,
+                    seed=self.seed,
+                    verbose=self.verbose,
+                    rerank_with_true_proxy_cb=_true_proxy_of,
+                )
+                self._log(
+                    f"  regional-gpu: best chain={out['best_chain']} "
+                    f"true_proxy={out['proxy_cost']:.4f}  iters={out['iters']}  "
+                    f"accepted={out['accepted']}\n"
+                    f"               gpu_costs ={[f'{c:.4f}' for c in out['all_chain_costs_gpu']]}\n"
+                    f"               true_costs={[f'{c:.4f}' for c in out['all_chain_costs_true']]}"
+                )
+                ev.restore(best_positions_np)
+            else:
+                self._log(
+                    f"Phase 4: regional polish  "
+                    f"grids={self.regional_grid_sizes}  budget={regional_budget:.0f}s "
+                    f"(of {total_remaining:.0f}s remaining)"
+                )
+                out = regional_polish(
+                    ev,
+                    region_grids=self.regional_grid_sizes,
+                    time_budget_s=regional_budget,
+                    list_len=self.regional_list_len,
+                    move_radius_frac=self.regional_move_radius_frac,
+                    seed=self.seed,
+                    verbose=self.verbose,
+                )
+                self._log(f"  regional: best fast={out['proxy_cost']:.4f}  iters={out['iters']}  accepted={out['accepted']}")
             tc = compute_proxy_cost(torch.from_numpy(ev.positions).float(), benchmark, plc)
             self._log(f"  oracle: {tc['proxy_cost']:.4f}  overlaps={tc['overlap_count']}")
             if tc["overlap_count"] == 0 and tc["proxy_cost"] < best_true:
