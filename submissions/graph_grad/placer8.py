@@ -960,14 +960,14 @@ class GraphGradPlacer:
     def __init__(
         self,
         seed: int = 42,
-        pop_size: int = 128,                # 3× the original to use Blackwell VRAM
-        n_epochs: int = 10,
-        steps_per_epoch: int = 10000,
+        pop_size: int = 96,                # 3× the original to use Blackwell VRAM
+        n_epochs: int = 8,
+        steps_per_epoch: int = 5000,
         grid_res: int = 64,
         time_budget_s: float = 3000.0,     # 50 min
         verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
-        soft_steps: int = 10000,            # Total Adam steps (was 3000)
+        soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
         n_restarts: int = 0,               # Independent restarts with different RNG seeds
         # LAHC tail stage (runs after analytical placement; bit-exact incremental
@@ -1071,6 +1071,8 @@ class GraphGradPlacer:
 
         # FastEvaluator picks up positions from benchmark.macro_positions
         benchmark.macro_positions = torch.from_numpy(best_pos_np).float()
+        self._log("LAHC tail: building FastEvaluator (~5-10s on large designs)...")
+        _fe_t0 = time.time()
         try:
             ev = FastEvaluator(benchmark, plc)
         except Exception as e:
@@ -1079,7 +1081,10 @@ class GraphGradPlacer:
 
         fast_cost = ev.proxy_cost()["proxy_cost"]
         drift = abs(fast_cost - best_cost) if best_cost != float("inf") else 0.0
-        self._log(f"LAHC tail FastEvaluator: fast={fast_cost:.4f} drift={drift:.4f}")
+        self._log(
+            f"LAHC tail FastEvaluator: built in {time.time()-_fe_t0:.1f}s  "
+            f"fast={fast_cost:.4f}  drift={drift:.4f}"
+        )
         if drift > 5e-3 and best_cost != float("inf"):
             self._log(f"  WARNING: FastEvaluator/oracle drift={drift:.4f}; LAHC may misrank")
 
@@ -1269,7 +1274,13 @@ class GraphGradPlacer:
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
-        for k in top_idx:
+        self._log(
+            f"top-K oracle scoring: {len(top_idx)} candidates  "
+            f"(each compute_proxy_cost call can take 5-15s on large designs)"
+        )
+        _score_t0 = time.time()
+        _score_last_log = _score_t0
+        for _i, k in enumerate(top_idx):
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
             pos_full = self._clip_soft_to_canvas(pos_full, benchmark, n_hard, cw, ch)
             full_t = torch.from_numpy(pos_full).float()
@@ -1279,6 +1290,14 @@ class GraphGradPlacer:
             if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
                 best_cost = c["proxy_cost"]
                 best_full = full_t
+            # Heartbeat: print at least every 15s so it doesn't look stuck.
+            if self.verbose and (time.time() - _score_last_log >= 15.0 or _i == len(top_idx) - 1):
+                self._log(
+                    f"  scored {_i+1}/{len(top_idx)} "
+                    f"elapsed={time.time()-_score_t0:.0f}s "
+                    f"best_so_far={best_cost:.4f}"
+                )
+                _score_last_log = time.time()
         # Anchor safety net
         full_anc = torch.zeros(n_macros, 2)
         full_anc[:n_hard] = hard_legal_t.cpu()
