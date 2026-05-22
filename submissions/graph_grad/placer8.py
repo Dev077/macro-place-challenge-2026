@@ -692,6 +692,7 @@ def tilos_rudy_normalized(
     ch: float,
     h_routes_per_um: float,
     v_routes_per_um: float,
+    gamma,
     smooth_range: int = 2,
     k_frac: float = 0.05,
 ) -> torch.Tensor:
@@ -701,16 +702,11 @@ def tilos_rudy_normalized(
     Steiner routing per net) but applies *the same per-axis normalisation*
     and *the same 1-D smoothing kernel*.
 
-    Steps:
-      1. Compute per-net bbox via hard min/max scatter (subgradient via
-         torch.min/max).
-      2. H-demand per cell = (wl_x / bbox_area) × (cell ∩ bbox area).
-         V-demand similarly.
-      3. Normalise V by grid_v_routes = grid_w × v_routes_per_um and H by
-         grid_h_routes = grid_h × h_routes_per_um (same as TILOS).
-      4. Apply TILOS's 1-D smoothing: V along columns, H along rows, kernel
-         size = 2*smooth_range + 1.
-      5. Concatenate V+H lists and return top-5% mean (TILOS's abu).
+    Per-net bbox is computed via log-sum-exp smoothing (γ·log Σ exp(x/γ)),
+    so *every* pin in a net contributes a non-zero subgradient — not just the
+    extremes. As γ → 0 this converges to hard min/max and matches the TILOS
+    oracle formula exactly; for γ > 0 it slightly overestimates the bbox in
+    exchange for a fully-dense gradient signal across pins.
     """
     K = pop.shape[0]
     device = pop.device
@@ -723,16 +719,10 @@ def tilos_rudy_normalized(
     pin_pos = owner_pos[:, owner_idx, :] + pin_off.unsqueeze(0)
     x = pin_pos[..., 0]
     y = pin_pos[..., 1]
-    idx = net_id.unsqueeze(0).expand(K, -1)
-    big = 1e9
-    x_max = torch.full((K, n_nets), -big, device=device, dtype=pop.dtype)
-    x_min = torch.full((K, n_nets), big, device=device, dtype=pop.dtype)
-    y_max = torch.full((K, n_nets), -big, device=device, dtype=pop.dtype)
-    y_min = torch.full((K, n_nets), big, device=device, dtype=pop.dtype)
-    x_max.scatter_reduce_(1, idx, x, reduce="amax", include_self=True)
-    x_min.scatter_reduce_(1, idx, x, reduce="amin", include_self=True)
-    y_max.scatter_reduce_(1, idx, y, reduce="amax", include_self=True)
-    y_min.scatter_reduce_(1, idx, y, reduce="amin", include_self=True)
+    x_max = _lse_max_per_net(x, net_id, gamma, n_nets)
+    x_min = -_lse_max_per_net(-x, net_id, gamma, n_nets)
+    y_max = _lse_max_per_net(y, net_id, gamma, n_nets)
+    y_min = -_lse_max_per_net(-y, net_id, gamma, n_nets)
     bbox_w = (x_max - x_min).clamp(min=1e-3)
     bbox_h = (y_max - y_min).clamp(min=1e-3)
     bbox_area = bbox_w * bbox_h
@@ -950,13 +940,13 @@ def _build_population_seeds(
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Compiled inner-loop surrogate (torch.compile ≈ 1.5–3× on the Adam step)
+# Compiled inner-loop loss (torch.compile gives ~3× on the Adam step)
+# ────────────────────────────────────────────────────────────────────────────
 #
 # gamma is passed as a 0-d tensor (not a Python float) so dynamo doesn't
-# specialize on its value and recompile every step. Per-benchmark recompile
-# (different N, n_nets, grid sizes) is fine — pays ~12-30s of compile time
-# once, saves ~100ms × 5000 = ~500s afterwards.
-# ────────────────────────────────────────────────────────────────────────────
+# specialize on its value and recompile every step.  Per-benchmark recompile
+# (different N, n_nets, grid sizes) is fine — pays ~12s of compile time once,
+# saves 100ms × 5000 = 500s afterwards.
 
 
 def _proxy_surrogate(
@@ -976,7 +966,7 @@ def _proxy_surrogate(
     h_per_um: float,
     v_per_um: float,
     gamma: torch.Tensor,
-):
+) -> torch.Tensor:
     wl = tilos_wl_normalized(
         pop, owner_idx, pin_off, net_id, n_nets, port_pos,
         n_hard, n_macros, gamma, cw, ch,
@@ -985,16 +975,13 @@ def _proxy_surrogate(
     cg = tilos_rudy_normalized(
         pop, owner_idx, pin_off, net_id, n_nets, port_pos,
         n_hard, n_macros, grid_col, grid_row, cw, ch,
-        h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+        h_per_um, v_per_um, gamma, smooth_range=2, k_frac=0.05,
     )
     proxy_surr = wl + 0.5 * dn + 0.5 * cg
     return proxy_surr.sum(), wl, dn, cg, proxy_surr
 
 
-try:
-    _proxy_surrogate_compiled = torch.compile(_proxy_surrogate, dynamic=False)
-except Exception:  # torch.compile unavailable / disabled — fall back to eager
-    _proxy_surrogate_compiled = _proxy_surrogate
+_proxy_surrogate_compiled = torch.compile(_proxy_surrogate, dynamic=False)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1012,27 +999,38 @@ class GraphGradPlacer:
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
         grid_res: int = 32,
-        time_budget_s: float = 3300.0,     # 55 min: 10 min koral + 45 min LAHC + margin
+        time_budget_s: float = 3300.0,     # 55 min: 10 min koral + 45 min PT + margin
         verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
         n_restarts: int = 0,               # Independent restarts with different RNG seeds
-        # LAHC tail stage (runs after analytical placement; bit-exact incremental
-        # proxy via FastEvaluator). Does NOT change koral's placement process —
-        # it only polishes the result. Disable with run_lahc=False.
-        run_lahc: bool = True,
-        lahc_budget_s: float = 2970.0,     # remaining budget after koral
-        lahc_list_len: int = 100,
-        lahc_min_budget_s: float = 2970.0, # hard floor: 49.5 min minimum for LAHC
-        lahc_log_interval_s: float = 15.0,
+        # PT tail stage (runs after analytical placement; GPU-batched Parallel
+        # Tempering on the TILOS proxy surrogate). Does NOT change koral's
+        # placement process — it only polishes the result. Disable with run_pt=False.
+        run_pt: bool = True,
+        pt_budget_s: float = 2700.0,       # remaining budget after koral
+        pt_min_budget_s: float = 2700.0,   # hard floor: 45 min minimum for PT
+        pt_log_interval_s: float = 15.0,
+        pt_n_replicas: int = 32,
+        pt_T_min: float = 5e-5,
+        pt_T_max: float = 5e-3,
+        pt_sigma_frac_min: float = 0.005,  # cold-replica Gaussian step (frac of canvas)
+        pt_sigma_frac_max: float = 0.05,   # hot-replica Gaussian step
+        pt_swap_every: int = 20,           # propose adjacent-rung swaps every N steps
+        pt_overlap_lambda: float = 50.0,   # hard-macro overlap penalty weight
         # Hard cap on the koral stage (Adam loop + top-K scoring + anchor check).
         # When this is hit, koral aborts whatever stage it's in and hands off
-        # to LAHC. Default 5 min ensures LAHC always gets ≥49.5 min.
-        koral_max_budget_s: float = 300.0,
+        # to PT. Default 10 min ensures PT always gets ≥45 min.
+        koral_max_budget_s: float = 600.0,
+        # Top-K oracle scoring early-exit: stop scoring candidates once we've
+        # had `koral_scoring_plateau_threshold` consecutive scores without
+        # improvement. Floor of `koral_scoring_min_candidates` always scored.
+        # Crucial on large designs (ibm17-18) where each oracle call costs 15s+.
+        koral_scoring_plateau_threshold: int = 4,
+        koral_scoring_min_candidates: int = 8,
         # Cap on the top-K candidates scored against the oracle in soft-only
-        # mode. Scoring also stops when the koral wall-clock deadline hits.
-        # Lower = faster (each oracle call is 5-15s on big designs).
+        # mode. Lower = faster (each oracle call is 5-15s on big designs).
         koral_k_eval: int = 24,
     ):
         self.seed = seed
@@ -1046,12 +1044,20 @@ class GraphGradPlacer:
         self.soft_steps = soft_steps
         self.soft_lr = soft_lr
         self.n_restarts = n_restarts
-        self.run_lahc = run_lahc
-        self.lahc_budget_s = lahc_budget_s
-        self.lahc_list_len = lahc_list_len
-        self.lahc_min_budget_s = lahc_min_budget_s
-        self.lahc_log_interval_s = lahc_log_interval_s
+        self.run_pt = run_pt
+        self.pt_budget_s = pt_budget_s
+        self.pt_min_budget_s = pt_min_budget_s
+        self.pt_log_interval_s = pt_log_interval_s
+        self.pt_n_replicas = pt_n_replicas
+        self.pt_T_min = pt_T_min
+        self.pt_T_max = pt_T_max
+        self.pt_sigma_frac_min = pt_sigma_frac_min
+        self.pt_sigma_frac_max = pt_sigma_frac_max
+        self.pt_swap_every = pt_swap_every
+        self.pt_overlap_lambda = pt_overlap_lambda
         self.koral_max_budget_s = koral_max_budget_s
+        self.koral_scoring_plateau_threshold = koral_scoring_plateau_threshold
+        self.koral_scoring_min_candidates = koral_scoring_min_candidates
         self.koral_k_eval = koral_k_eval
         # Filled in by place(); used by inner loops as a hard wall-clock deadline.
         self._koral_deadline: Optional[float] = None
@@ -1077,114 +1083,129 @@ class GraphGradPlacer:
         self._log(
             f"place: config  lock_hard={self.lock_hard}  n_restarts={self.n_restarts}  "
             f"pop_size={self.pop_size}  soft_steps={self.soft_steps}  "
-            f"run_lahc={self.run_lahc}  koral_max={self.koral_max_budget_s:.0f}s"
+            f"run_pt={self.run_pt}  koral_max={self.koral_max_budget_s:.0f}s"
         )
         if self.lock_hard:
             koral_positions = self._place_soft_only(benchmark)
         else:
             koral_positions = self._place_joint(benchmark)
-        # LAHC tail polish (does not alter koral's analytical placement).
+        # PT tail polish (does not alter koral's analytical placement).
         # The total time budget self.time_budget_s is a HARD ceiling on koral +
-        # LAHC combined. LAHC gets `time_budget_s - elapsed - margin`, clamped
-        # to `lahc_min_budget_s` floor so it always runs for at least a minute.
-        if self.run_lahc:
+        # PT combined. PT gets `time_budget_s - elapsed - margin`, clamped to
+        # `pt_min_budget_s` floor so it always runs for at least a minute.
+        if self.run_pt:
             elapsed = time.time() - t0
             margin = 30.0  # final oracle + tensor conversion overhead
             remaining = self.time_budget_s - elapsed - margin
             self._log(
                 f"place: koral elapsed={elapsed:.1f}s  total_budget={self.time_budget_s:.0f}s  "
-                f"LAHC remaining={remaining:.0f}s (floor={self.lahc_min_budget_s:.0f}s)"
+                f"PT remaining={remaining:.0f}s (floor={self.pt_min_budget_s:.0f}s)"
             )
-            return self._lahc_tail(benchmark, koral_positions, lahc_budget_override=remaining)
+            return self._pt_tail(benchmark, koral_positions, pt_budget_override=remaining)
         return koral_positions
 
-    def _lahc_tail(
+    def _pt_tail(
         self,
         benchmark: Benchmark,
         koral_positions: torch.Tensor,
-        lahc_budget_override: Optional[float] = None,
+        pt_budget_override: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run LAHC polish on koral's output. Only commits a strictly better,
+        """Run GPU-PT polish on koral's output. Only commits a strictly better,
         zero-overlap result; otherwise returns koral's positions unchanged."""
         from macro_place.objective import compute_proxy_cost
 
         t0 = time.time()
-        # Guard: if koral returned None for any reason, fall back to initial.plc
         if koral_positions is None:
-            self._log("LAHC tail: koral returned None; using initial.plc as fallback")
+            self._log("PT tail: koral returned None; using initial.plc as fallback")
             koral_positions = benchmark.macro_positions.clone().float()
 
         plc = _load_plc(benchmark.name)
         if plc is None:
-            self._log("LAHC tail: plc=None; skipping (FastEvaluator requires plc)")
+            self._log("PT tail: plc=None; skipping (no way to oracle-verify)")
             return koral_positions
 
-        best_pos_np = koral_positions.detach().cpu().numpy().astype(np.float64).copy()
         try:
             baseline = compute_proxy_cost(koral_positions.float(), benchmark, plc)
             self._log(
-                f"LAHC tail baseline: proxy={baseline['proxy_cost']:.4f} "
+                f"PT tail baseline: proxy={baseline['proxy_cost']:.4f} "
                 f"overlaps={baseline['overlap_count']}"
             )
-            best_cost = float(baseline["proxy_cost"]) if baseline["overlap_count"] == 0 else float("inf")
+            best_cost = (
+                float(baseline["proxy_cost"])
+                if baseline["overlap_count"] == 0
+                else float("inf")
+            )
         except Exception as e:
-            self._log(f"LAHC tail baseline oracle failed: {e}; skipping")
+            self._log(f"PT tail baseline oracle failed: {e}; skipping")
             return koral_positions
 
-        # FastEvaluator picks up positions from benchmark.macro_positions
-        benchmark.macro_positions = torch.from_numpy(best_pos_np).float()
-        self._log("LAHC tail: building FastEvaluator (~5-10s on large designs)...")
-        _fe_t0 = time.time()
-        try:
-            ev = FastEvaluator(benchmark, plc)
-        except Exception as e:
-            self._log(f"LAHC tail FastEvaluator build failed: {e}; returning koral output")
-            return koral_positions
-
-        fast_cost = ev.proxy_cost()["proxy_cost"]
-        drift = abs(fast_cost - best_cost) if best_cost != float("inf") else 0.0
-        self._log(
-            f"LAHC tail FastEvaluator: built in {time.time()-_fe_t0:.1f}s  "
-            f"fast={fast_cost:.4f}  drift={drift:.4f}"
+        best_pos = koral_positions.clone()
+        budget_target = (
+            pt_budget_override if pt_budget_override is not None else self.pt_budget_s
         )
-        if drift > 5e-3 and best_cost != float("inf"):
-            self._log(f"  WARNING: FastEvaluator/oracle drift={drift:.4f}; LAHC may misrank")
-
-        budget_target = lahc_budget_override if lahc_budget_override is not None else self.lahc_budget_s
-        budget = max(self.lahc_min_budget_s, budget_target)
-        self._log(f"LAHC tail: polish budget={budget:.0f}s")
+        budget = max(self.pt_min_budget_s, budget_target)
+        self._log(
+            f"PT tail: polish budget={budget:.0f}s  n_replicas={self.pt_n_replicas}  "
+            f"T=[{self.pt_T_min:.1e}, {self.pt_T_max:.1e}]"
+        )
         try:
-            out = lahc_polish(
-                ev,
-                list_len=self.lahc_list_len,
+            pt_pos, pt_cost = pt_polish(
+                benchmark,
+                koral_positions,
+                n_replicas=self.pt_n_replicas,
+                T_min=self.pt_T_min,
+                T_max=self.pt_T_max,
+                sigma_frac_min=self.pt_sigma_frac_min,
+                sigma_frac_max=self.pt_sigma_frac_max,
+                swap_every=self.pt_swap_every,
+                overlap_lambda=self.pt_overlap_lambda,
                 time_budget_s=budget,
                 seed=self.seed,
                 verbose=self.verbose,
-                log_interval_s=self.lahc_log_interval_s,
+                log_interval_s=self.pt_log_interval_s,
             )
-            self._log(f"LAHC tail done: fast_best={out['proxy_cost']:.4f} iters={out['iters']}")
+            self._log(f"PT tail done: surr_best={pt_cost:.4f}")
         except Exception as e:
-            self._log(f"LAHC tail raised: {e}; returning koral output")
+            import traceback
+            self._log(f"PT tail raised: {e}; returning koral output")
+            traceback.print_exc()
             return koral_positions
 
-        # Oracle-verify; only commit if zero-overlap and strictly better.
+        # Post-PT legalization: hard macros may overlap (PT used a smooth penalty,
+        # not an exact constraint). Shelf-pack them back to legality before oracle.
+        n_hard = benchmark.num_hard_macros
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
+        sizes_np = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
+        movable_np = benchmark.get_movable_mask()[:n_hard].numpy()
+        pt_np = pt_pos.cpu().numpy().astype(np.float64)
         try:
-            cand = compute_proxy_cost(torch.from_numpy(ev.positions).float(), benchmark, plc)
+            pt_np[:n_hard] = _legalize(
+                pt_np[:n_hard], sizes_np, movable_np, cw, ch, gap=0.005
+            )
+        except Exception as e:
+            self._log(f"PT tail legalize raised: {e}; keeping koral output")
+            return koral_positions
+        pt_np = self._clip_soft_to_canvas(pt_np, benchmark, n_hard, cw, ch)
+        pt_legal = torch.from_numpy(pt_np).float()
+
+        try:
+            cand = compute_proxy_cost(pt_legal, benchmark, plc)
             self._log(
-                f"LAHC tail oracle: proxy={cand['proxy_cost']:.4f} "
+                f"PT tail oracle: proxy={cand['proxy_cost']:.4f} "
                 f"overlaps={cand['overlap_count']} baseline={best_cost:.4f}"
             )
             if cand["overlap_count"] == 0 and cand["proxy_cost"] < best_cost:
                 best_cost = float(cand["proxy_cost"])
-                best_pos_np = ev.positions.copy()
-                self._log(f"  committing LAHC result: {best_cost:.4f}")
+                best_pos = pt_legal
+                self._log(f"  committing PT result: {best_cost:.4f}")
             else:
-                self._log("  LAHC did not improve; keeping koral output")
+                self._log("  PT did not improve; keeping koral output")
         except Exception as e:
-            self._log(f"LAHC tail final oracle check failed: {e}; keeping koral output")
+            self._log(f"PT tail final oracle check failed: {e}; keeping koral output")
 
-        self._log(f"LAHC tail elapsed: {time.time()-t0:.1f}s")
-        return torch.from_numpy(best_pos_np).float()
+        self._log(f"PT tail elapsed: {time.time()-t0:.1f}s")
+        return best_pos
 
     def _place_soft_only(self, benchmark: Benchmark) -> torch.Tensor:
         """
@@ -1291,8 +1312,7 @@ class GraphGradPlacer:
             self._koral_deadline - 0.10 * self.koral_max_budget_s
             if self._koral_deadline is not None else None
         )
-        # Pre-allocate gamma as a 0-d tensor so torch.compile doesn't recompile
-        # the graph each step on a changing Python float.
+        # Pre-allocate gamma tensor so torch.compile doesn't recompile each step.
         gamma_t = torch.tensor(1.0, device=device, dtype=torch.float32)
         for step in range(n_steps):
             # Hard wall-clock check: bail early if the koral budget is almost up.
@@ -1335,7 +1355,7 @@ class GraphGradPlacer:
             cong = tilos_rudy_normalized(
                 pop, owner_idx, pin_off, net_id, n_nets, port_pos,
                 n_hard, n_macros, grid_col, grid_row, cw, ch,
-                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+                h_per_um, v_per_um, 0.05, smooth_range=2, k_frac=0.05,
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
         k_eval = min(K, self.koral_k_eval)
@@ -1344,12 +1364,16 @@ class GraphGradPlacer:
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
+        plateau_th = self.koral_scoring_plateau_threshold
+        min_scored = max(self.koral_scoring_min_candidates, plateau_th)
         self._log(
             f"top-K oracle scoring: up to {len(top_idx)} candidates  "
-            f"(stops on koral deadline)"
+            f"(plateau early-exit after {plateau_th} non-improving scores, "
+            f"min {min_scored} always scored)"
         )
         _score_t0 = time.time()
         _score_last_log = _score_t0
+        no_improve = 0
         scored_total = 0
         for _i, k in enumerate(top_idx):
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
@@ -1359,22 +1383,34 @@ class GraphGradPlacer:
                 continue
             c = compute_proxy_cost(full_t, benchmark, plc)
             scored_total = _i + 1
-            if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
+            improved = c["overlap_count"] == 0 and c["proxy_cost"] < best_cost
+            if improved:
                 best_cost = c["proxy_cost"]
                 best_full = full_t
+                no_improve = 0
+            else:
+                no_improve += 1
             # Heartbeat: print at least every 15s so it doesn't look stuck.
             if self.verbose and (time.time() - _score_last_log >= 15.0 or _i == len(top_idx) - 1):
                 self._log(
                     f"  scored {scored_total}/{len(top_idx)} "
                     f"elapsed={time.time()-_score_t0:.0f}s "
-                    f"best_so_far={best_cost:.4f}"
+                    f"best_so_far={best_cost:.4f}  no_improve={no_improve}"
                 )
                 _score_last_log = time.time()
+            # Plateau early-exit (after we've scored at least min_scored)
+            if scored_total >= min_scored and no_improve >= plateau_th:
+                self._log(
+                    f"  plateau: {no_improve} non-improving candidates in a row; "
+                    f"stopping early at {scored_total}/{len(top_idx)} "
+                    f"(saved ~{(len(top_idx)-scored_total)*((time.time()-_score_t0)/scored_total):.0f}s)"
+                )
+                break
             # Hard wall-clock check: respect the koral budget ceiling.
             if self._koral_deadline is not None and time.time() >= self._koral_deadline:
                 self._log(
                     f"  koral deadline hit during scoring at {scored_total}/{len(top_idx)}; "
-                    f"handing off to LAHC"
+                    f"handing off to PT"
                 )
                 break
         # Anchor safety net
@@ -1497,7 +1533,7 @@ class GraphGradPlacer:
                 cong = tilos_rudy_normalized(
                     pop, owner_idx, pin_off, net_id, n_nets, port_pos,
                     n_hard, n_macros, grid_col, grid_row, cw, ch,
-                    h_per_um, v_per_um, smooth_range=smooth_rng, k_frac=0.05,
+                    h_per_um, v_per_um, gamma, smooth_range=smooth_rng, k_frac=0.05,
                 )
                 ov = overlap_loss_hard(pop[:, :n_hard], sizes_hard)
                 anch = anchor_reg(pop, anchor_pos_t, anchor_mask)
@@ -1626,721 +1662,204 @@ class GraphGradPlacer:
             pos_full[i, 0] = max(hw + margin, min(cw - hw - margin, pos_full[i, 0]))
             pos_full[i, 1] = max(hh + margin, min(ch - hh - margin, pos_full[i, 1]))
         return pos_full
+
+
 # ────────────────────────────────────────────────────────────────────────────
-# Phase 1 — FastEvaluator (bit-exact mirror of PlacementCost)
-# ────────────────────────────────────────────────────────────────────────────
-
-
-class FastEvaluator:
-    """NumPy reimplementation of PlacementCost.get_cost / get_density_cost /
-    get_congestion_cost with incremental update support.
-
-    Validated bit-exact against PlacementCost on ibm01 (and others); a single
-    move_macro() call is ~2 ms (vs ~4000 ms for the oracle).
-    """
-
-    def __init__(self, benchmark: Benchmark, plc):
-        self.benchmark = benchmark
-        self.cw = float(benchmark.canvas_width)
-        self.ch = float(benchmark.canvas_height)
-        self.grid_col = int(benchmark.grid_cols)
-        self.grid_row = int(benchmark.grid_rows)
-        self.gw = self.cw / self.grid_col
-        self.gh = self.ch / self.grid_row
-        self.grid_area = self.gw * self.gh
-        self.h_per_um = float(benchmark.hroutes_per_micron)
-        self.v_per_um = float(benchmark.vroutes_per_micron)
-        self.grid_v_routes = self.gw * self.v_per_um
-        self.grid_h_routes = self.gh * self.h_per_um
-        # Routing allocation + smoothing range come from PlacementCost.
-        self.h_alloc = 0.0
-        self.v_alloc = 0.0
-        self.smooth_range = 2
-        if plc is not None:
-            try:
-                self.h_alloc, self.v_alloc = plc.get_macro_routing_allocation()
-            except Exception:
-                self.h_alloc = getattr(plc, "hrouting_alloc", 0.0)
-                self.v_alloc = getattr(plc, "vrouting_alloc", 0.0)
-            try:
-                self.smooth_range = int(plc.get_congestion_smooth_range())
-            except Exception:
-                self.smooth_range = int(getattr(plc, "smooth_range", 2))
-        self.n_hard = benchmark.num_hard_macros
-        self.n_macros = benchmark.num_macros
-        self.n_soft = self.n_macros - self.n_hard
-        self.n_nets = int(benchmark.num_nets)
-        self.n_ports = int(benchmark.port_positions.shape[0])
-        # WL normalization uses plc.net_cnt (counts every driver pin, not just nets with sinks)
-        self.wl_norm_n_nets = int(getattr(plc, "net_cnt", self.n_nets)) if plc is not None else self.n_nets
-        if self.wl_norm_n_nets <= 0:
-            self.wl_norm_n_nets = max(self.n_nets, 1)
-        # State arrays
-        self.positions = benchmark.macro_positions.detach().cpu().numpy().astype(np.float64)
-        self.sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float64)
-        self.half = self.sizes / 2.0
-        self.port_pos = benchmark.port_positions.detach().cpu().numpy().astype(np.float64) if self.n_ports else np.zeros((0, 2))
-        self.movable = benchmark.get_movable_mask().detach().cpu().numpy().astype(bool)
-        # Per-net tables
-        self._build_net_pin_tables(benchmark)
-        self._net_xmin = np.zeros(self.n_nets, dtype=np.float64)
-        self._net_ymin = np.zeros(self.n_nets, dtype=np.float64)
-        self._net_xmax = np.zeros(self.n_nets, dtype=np.float64)
-        self._net_ymax = np.zeros(self.n_nets, dtype=np.float64)
-        self._net_weight = np.ones(self.n_nets, dtype=np.float64)
-        if plc is not None:
-            self._fetch_net_weights(plc)
-        self._owner_to_nets: Dict[int, List[int]] = {}
-        for n in range(self.n_nets):
-            for o in self.net_owner[n]:
-                self._owner_to_nets.setdefault(int(o), []).append(n)
-        # Grids
-        self.density_grid = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
-        self.h_pin_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
-        self.v_pin_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
-        self.h_macro_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
-        self.v_macro_cong = np.zeros((self.grid_row, self.grid_col), dtype=np.float64)
-        self._init_caches()
-
-    def _build_net_pin_tables(self, benchmark: Benchmark):
-        pin_offsets = benchmark.macro_pin_offsets
-        npn = benchmark.net_pin_nodes
-        self.net_owner: List[np.ndarray] = []
-        self.net_offx: List[np.ndarray] = []
-        self.net_offy: List[np.ndarray] = []
-        if not npn:
-            for n in range(self.n_nets):
-                nodes = benchmark.net_nodes[n].cpu().numpy().astype(np.int64) if benchmark.net_nodes else np.zeros(0, dtype=np.int64)
-                self.net_owner.append(nodes)
-                self.net_offx.append(np.zeros(nodes.shape[0]))
-                self.net_offy.append(np.zeros(nodes.shape[0]))
-            return
-        for n in range(self.n_nets):
-            pn = npn[n].cpu().numpy().astype(np.int64)
-            if pn.size == 0:
-                self.net_owner.append(np.zeros(0, dtype=np.int64))
-                self.net_offx.append(np.zeros(0))
-                self.net_offy.append(np.zeros(0))
-                continue
-            owners = pn[:, 0]
-            slots = pn[:, 1]
-            offx = np.zeros(owners.shape[0])
-            offy = np.zeros(owners.shape[0])
-            for k in range(owners.shape[0]):
-                o, s = int(owners[k]), int(slots[k])
-                if o < self.n_hard and pin_offsets and o < len(pin_offsets):
-                    po = pin_offsets[o]
-                    if po is not None and po.shape[0] > s:
-                        offx[k] = float(po[s, 0])
-                        offy[k] = float(po[s, 1])
-            self.net_owner.append(owners)
-            self.net_offx.append(offx)
-            self.net_offy.append(offy)
-
-    def _fetch_net_weights(self, plc):
-        try:
-            driver_names = list(plc.nets.keys())
-            for n in range(min(self.n_nets, len(driver_names))):
-                pi = plc.mod_name_to_indices[driver_names[n]]
-                self._net_weight[n] = float(plc.modules_w_pins[pi].get_weight())
-        except Exception:
-            pass
-
-    def _pin_x(self, owners, offx):
-        out = np.empty(owners.shape[0], dtype=np.float64)
-        m = owners < self.n_macros
-        out[m] = self.positions[owners[m], 0] + offx[m]
-        if (~m).any():
-            p_idx = owners[~m] - self.n_macros
-            out[~m] = self.port_pos[p_idx, 0] + offx[~m]
-        return out
-
-    def _pin_y(self, owners, offy):
-        out = np.empty(owners.shape[0], dtype=np.float64)
-        m = owners < self.n_macros
-        out[m] = self.positions[owners[m], 1] + offy[m]
-        if (~m).any():
-            p_idx = owners[~m] - self.n_macros
-            out[~m] = self.port_pos[p_idx, 1] + offy[~m]
-        return out
-
-    def _net_bbox(self, n):
-        owners = self.net_owner[n]
-        if owners.size == 0:
-            return 0.0, 0.0, 0.0, 0.0
-        xs = self._pin_x(owners, self.net_offx[n])
-        ys = self._pin_y(owners, self.net_offy[n])
-        return xs.min(), ys.min(), xs.max(), ys.max()
-
-    def _grid_cell(self, x, y):
-        c = int(math.floor(x / self.gw))
-        r = int(math.floor(y / self.gh))
-        return max(0, min(self.grid_row - 1, r)), max(0, min(self.grid_col - 1, c))
-
-    def _add_macro_density(self, macro_idx, sign=+1):
-        x, y = self.positions[macro_idx]
-        w, h = self.sizes[macro_idx]
-        x_min, x_max = x - w / 2, x + w / 2
-        y_min, y_max = y - h / 2, y + h / 2
-        ur_r, ur_c = self._grid_cell(x_max, y_max)
-        bl_r, bl_c = self._grid_cell(x_min, y_min)
-        for r in range(bl_r, ur_r + 1):
-            gy0 = r * self.gh
-            gy1 = (r + 1) * self.gh
-            dy = min(y_max, gy1) - max(y_min, gy0)
-            if dy <= 0:
-                continue
-            for c in range(bl_c, ur_c + 1):
-                gx0 = c * self.gw
-                gx1 = (c + 1) * self.gw
-                dx = min(x_max, gx1) - max(x_min, gx0)
-                if dx <= 0:
-                    continue
-                self.density_grid[r, c] += sign * dx * dy
-
-    def _add_macro_route(self, macro_idx, sign=+1):
-        x, y = self.positions[macro_idx]
-        w, h = self.sizes[macro_idx]
-        x_min, x_max = x - w / 2, x + w / 2
-        y_min, y_max = y - h / 2, y + h / 2
-        ur_r, ur_c = self._grid_cell(x_max, y_max)
-        bl_r, bl_c = self._grid_cell(x_min, y_min)
-        partial_v = False
-        partial_h = False
-        eps = 1e-5
-        for r in range(bl_r, ur_r + 1):
-            gy0 = r * self.gh
-            gy1 = (r + 1) * self.gh
-            dy = min(y_max, gy1) - max(y_min, gy0)
-            if dy <= 0:
-                continue
-            for c in range(bl_c, ur_c + 1):
-                gx0 = c * self.gw
-                gx1 = (c + 1) * self.gw
-                dx = min(x_max, gx1) - max(x_min, gx0)
-                if dx <= 0:
-                    continue
-                self.v_macro_cong[r, c] += sign * dx * self.v_alloc
-                self.h_macro_cong[r, c] += sign * dy * self.h_alloc
-                if ur_r != bl_r and (r == bl_r or r == ur_r) and abs(dy - self.gh) > eps:
-                    partial_v = True
-                if ur_c != bl_c and (c == bl_c or c == ur_c) and abs(dx - self.gw) > eps:
-                    partial_h = True
-        if partial_v:
-            r = ur_r
-            for c in range(bl_c, ur_c + 1):
-                gx0, gx1 = c * self.gw, (c + 1) * self.gw
-                dx = min(x_max, gx1) - max(x_min, gx0)
-                if dx > 0:
-                    self.v_macro_cong[r, c] -= sign * dx * self.v_alloc
-        if partial_h:
-            c = ur_c
-            for r in range(bl_r, ur_r + 1):
-                gy0, gy1 = r * self.gh, (r + 1) * self.gh
-                dy = min(y_max, gy1) - max(y_min, gy0)
-                if dy > 0:
-                    self.h_macro_cong[r, c] -= sign * dy * self.h_alloc
-
-    def _route_pin_cong(self, net_idx, sign=+1):
-        owners = self.net_owner[net_idx]
-        if owners.size == 0:
-            return
-        xs = self._pin_x(owners, self.net_offx[net_idx])
-        ys = self._pin_y(owners, self.net_offy[net_idx])
-        cells = []
-        cells_set = set()
-        for i in range(owners.shape[0]):
-            r, c = self._grid_cell(xs[i], ys[i])
-            cells.append((r, c))
-            cells_set.add((r, c))
-        if len(cells_set) <= 1:
-            return
-        src = cells[0]
-        w = self._net_weight[net_idx]
-        if len(cells_set) == 2:
-            self._two_pin(src, list(cells_set), w, sign)
-        elif len(cells_set) == 3:
-            self._three_pin(list(cells_set), w, sign)
-        else:
-            for n in cells_set:
-                if n == src:
-                    continue
-                self._two_pin(src, [src, n], w, sign)
-
-    def _two_pin(self, src, two, w, sign):
-        sink = two[1] if two[0] == src else two[0]
-        r_min, r_max = min(src[0], sink[0]), max(src[0], sink[0])
-        c_min, c_max = min(src[1], sink[1]), max(src[1], sink[1])
-        if c_max > c_min:
-            self.h_pin_cong[src[0], c_min:c_max] += sign * w
-        if r_max > r_min:
-            self.v_pin_cong[r_min:r_max, sink[1]] += sign * w
-
-    def _three_pin(self, cells, w, sign):
-        cs = sorted(cells, key=lambda x: (x[1], x[0]))
-        (y1, x1), (y2, x2), (y3, x3) = cs
-        if x1 < x2 < x3 and min(y1, y3) < y2 and max(y1, y3) > y2:
-            self._l(cs, w, sign)
-        elif x2 == x3 and x1 < x2 and y1 < min(y2, y3):
-            if x2 > x1:
-                self.h_pin_cong[y1, x1:x2] += sign * w
-            r_lo, r_hi = y1, max(y2, y3)
-            if r_hi > r_lo:
-                self.v_pin_cong[r_lo:r_hi, x2] += sign * w
-        elif y2 == y3:
-            if x2 > x1:
-                self.h_pin_cong[y1, x1:x2] += sign * w
-            if x3 > x2:
-                self.h_pin_cong[y2, x2:x3] += sign * w
-            r_lo, r_hi = min(y1, y2), max(y1, y2)
-            if r_hi > r_lo:
-                self.v_pin_cong[r_lo:r_hi, x2] += sign * w
-        else:
-            self._t(cs, w, sign)
-
-    def _l(self, cs, w, sign):
-        (y1, x1), (y2, x2), (y3, x3) = cs
-        if x2 > x1:
-            self.h_pin_cong[y1, x1:x2] += sign * w
-        if x3 > x2:
-            self.h_pin_cong[y2, x2:x3] += sign * w
-        r_lo, r_hi = min(y1, y2), max(y1, y2)
-        if r_hi > r_lo:
-            self.v_pin_cong[r_lo:r_hi, x2] += sign * w
-        r_lo, r_hi = min(y2, y3), max(y2, y3)
-        if r_hi > r_lo:
-            self.v_pin_cong[r_lo:r_hi, x3] += sign * w
-
-    def _t(self, cs, w, sign):
-        cs2 = sorted(cs)
-        (y1, x1), (y2, x2), (y3, x3) = cs2
-        xmin = min(x1, x2, x3)
-        xmax = max(x1, x2, x3)
-        if xmax > xmin:
-            self.h_pin_cong[y2, xmin:xmax] += sign * w
-        r_lo, r_hi = min(y1, y2), max(y1, y2)
-        if r_hi > r_lo:
-            self.v_pin_cong[r_lo:r_hi, x1] += sign * w
-        r_lo, r_hi = min(y2, y3), max(y2, y3)
-        if r_hi > r_lo:
-            self.v_pin_cong[r_lo:r_hi, x3] += sign * w
-
-    def _init_caches(self):
-        self.density_grid[...] = 0
-        self.h_pin_cong[...] = 0
-        self.v_pin_cong[...] = 0
-        self.h_macro_cong[...] = 0
-        self.v_macro_cong[...] = 0
-        for m in range(self.n_macros):
-            self._add_macro_density(m, +1)
-        for m in range(self.n_hard):
-            self._add_macro_route(m, +1)
-        for n in range(self.n_nets):
-            x0, y0, x1, y1 = self._net_bbox(n)
-            self._net_xmin[n] = x0
-            self._net_ymin[n] = y0
-            self._net_xmax[n] = x1
-            self._net_ymax[n] = y1
-            self._route_pin_cong(n, +1)
-
-    def _density_cost(self):
-        gc = (self.density_grid / self.grid_area).ravel()
-        nz = gc[gc > 0]
-        if nz.size == 0:
-            return 0.0
-        N = gc.size
-        if N < 10:
-            return 0.5 * float(nz.mean())
-        cnt = math.floor(N * 0.1)
-        if cnt == 0:
-            return 0.5 * float(nz.max())
-        sd = np.sort(nz)[::-1]
-        take = min(cnt, sd.size)
-        return 0.5 * float(sd[:take].sum() / cnt)
-
-    def _smooth(self, grid, axis):
-        sr = self.smooth_range
-        R, C = grid.shape
-        if axis == 0:
-            cols = np.arange(C)
-            lp = np.maximum(0, cols - sr)
-            rp = np.minimum(C - 1, cols + sr)
-            cnt = (rp - lp + 1).astype(np.float64)
-            scaled = grid / cnt[np.newaxis, :]
-            pad = np.pad(scaled, ((0, 0), (sr, sr)), mode="constant")
-            cs = np.cumsum(pad, axis=1)
-            cs0 = cs[:, 2 * sr:]
-            cs1 = np.concatenate([np.zeros((R, 1)), cs[:, :C - 1 + 2 * sr]], axis=1)[:, :C]
-            return cs0[:, :C] - cs1
-        else:
-            rows = np.arange(R)
-            lp = np.maximum(0, rows - sr)
-            up = np.minimum(R - 1, rows + sr)
-            cnt = (up - lp + 1).astype(np.float64)
-            scaled = grid / cnt[:, np.newaxis]
-            pad = np.pad(scaled, ((sr, sr), (0, 0)), mode="constant")
-            cs = np.cumsum(pad, axis=0)
-            cs0 = cs[2 * sr:, :]
-            cs1 = np.concatenate([np.zeros((1, C)), cs[:R - 1 + 2 * sr, :]], axis=0)[:R, :]
-            return cs0[:R, :] - cs1
-
-    def _congestion_cost(self):
-        v = self.v_pin_cong / self.grid_v_routes
-        h = self.h_pin_cong / self.grid_h_routes
-        vm = self.v_macro_cong / self.grid_v_routes
-        hm = self.h_macro_cong / self.grid_h_routes
-        v_s = self._smooth(v, axis=0)
-        h_s = self._smooth(h, axis=1)
-        combined = np.concatenate([(v_s + vm).ravel(), (h_s + hm).ravel()])
-        xs = np.sort(combined)[::-1]
-        cnt = math.floor(xs.size * 0.05)
-        if cnt == 0:
-            return float(xs.max()) if xs.size else 0.0
-        return float(xs[:cnt].mean())
-
-    def _wirelength_cost(self):
-        hpwl = (self._net_xmax - self._net_xmin) + (self._net_ymax - self._net_ymin)
-        return float(np.sum(hpwl * self._net_weight)) / ((self.cw + self.ch) * self.wl_norm_n_nets)
-
-    def proxy_cost(self):
-        wl = self._wirelength_cost()
-        d = self._density_cost()
-        c = self._congestion_cost()
-        return {
-            "proxy_cost": wl + 0.5 * d + 0.5 * c,
-            "wirelength_cost": wl,
-            "density_cost": d,
-            "congestion_cost": c,
-        }
-
-    def move_macro(self, macro_idx, new_x, new_y, is_hard=True):
-        if is_hard:
-            self._add_macro_route(macro_idx, -1)
-        self._add_macro_density(macro_idx, -1)
-        nets = self._owner_to_nets.get(macro_idx, ())
-        for n in nets:
-            self._route_pin_cong(n, -1)
-        self.positions[macro_idx, 0] = new_x
-        self.positions[macro_idx, 1] = new_y
-        self._add_macro_density(macro_idx, +1)
-        if is_hard:
-            self._add_macro_route(macro_idx, +1)
-        for n in nets:
-            x0, y0, x1, y1 = self._net_bbox(n)
-            self._net_xmin[n] = x0
-            self._net_ymin[n] = y0
-            self._net_xmax[n] = x1
-            self._net_ymax[n] = y1
-            self._route_pin_cong(n, +1)
-
-    def swap_macros(self, i, j):
-        xi, yi = self.positions[i]
-        xj, yj = self.positions[j]
-        self.move_macro(i, xj, yj, is_hard=(i < self.n_hard))
-        self.move_macro(j, xi, yi, is_hard=(j < self.n_hard))
-
-    def snapshot(self):
-        return self.positions.copy()
-
-    def restore(self, positions):
-        if np.array_equal(positions, self.positions):
-            return
-        self.positions[:] = positions
-        self._init_caches()
-
-
-
-def _swap_legal(ev: FastEvaluator, i: int, j: int) -> bool:
-    pi = ev.positions[i].copy()
-    pj = ev.positions[j].copy()
-    hi = ev.half[i]
-    hj = ev.half[j]
-    if pj[0] - hi[0] < 0 or pj[0] + hi[0] > ev.cw:
-        return False
-    if pj[1] - hi[1] < 0 or pj[1] + hi[1] > ev.ch:
-        return False
-    if pi[0] - hj[0] < 0 or pi[0] + hj[0] > ev.cw:
-        return False
-    if pi[1] - hj[1] < 0 or pi[1] + hj[1] > ev.ch:
-        return False
-    for k in range(ev.n_hard):
-        if k == i or k == j:
-            continue
-        pk = ev.positions[k]
-        sk = ev.sizes[k]
-        ox = (ev.sizes[i, 0] + sk[0]) / 2 - abs(pj[0] - pk[0])
-        oy = (ev.sizes[i, 1] + sk[1]) / 2 - abs(pj[1] - pk[1])
-        if ox > 0 and oy > 0:
-            return False
-        ox = (ev.sizes[j, 0] + sk[0]) / 2 - abs(pi[0] - pk[0])
-        oy = (ev.sizes[j, 1] + sk[1]) / 2 - abs(pi[1] - pk[1])
-        if ox > 0 and oy > 0:
-            return False
-    return True
-
-
-def _slide_legal(ev: FastEvaluator, i: int, nx: float, ny: float) -> bool:
-    half = ev.half[i]
-    if nx - half[0] < 0 or nx + half[0] > ev.cw:
-        return False
-    if ny - half[1] < 0 or ny + half[1] > ev.ch:
-        return False
-    for k in range(ev.n_hard):
-        if k == i:
-            continue
-        pk = ev.positions[k]
-        sk = ev.sizes[k]
-        ox = (ev.sizes[i, 0] + sk[0]) / 2 - abs(nx - pk[0])
-        oy = (ev.sizes[i, 1] + sk[1]) / 2 - abs(ny - pk[1])
-        if ox > 0 and oy > 0:
-            return False
-    return True
-# ────────────────────────────────────────────────────────────────────────────
-# Phase 2.5 — Direct congestion-attack (true grid)
+# Phase 3 — GPU Parallel Tempering polish
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _smoothed_congestion_grid(ev: FastEvaluator) -> np.ndarray:
-    """Compute the FastEvaluator's smoothed combined V+H congestion grid.
-
-    This is the SAME math that produces the top-5% mean in `_congestion_cost`,
-    exposed for the direct-attack phase that wants to know WHICH cells are hot.
-    """
-    v = ev.v_pin_cong / ev.grid_v_routes
-    h = ev.h_pin_cong / ev.grid_h_routes
-    vm = ev.v_macro_cong / ev.grid_v_routes
-    hm = ev.h_macro_cong / ev.grid_h_routes
-    v_s = ev._smooth(v, axis=0)
-    h_s = ev._smooth(h, axis=1)
-    return (v_s + vm) + (h_s + hm)
-# ────────────────────────────────────────────────────────────────────────────
-# Phase 3 — LAHC polish (centroid-biased soft + hard swap/slide)
-# ────────────────────────────────────────────────────────────────────────────
-
-
-def _soft_centroid_target(ev: FastEvaluator, soft_global_idx: int):
-    nets = ev._owner_to_nets.get(soft_global_idx, ())
-    if not nets:
-        return None
-    total_w = 0.0
-    sum_x = 0.0
-    sum_y = 0.0
-    for n in nets:
-        owners = ev.net_owner[n]
-        if owners.size < 2:
-            continue
-        xs = ev._pin_x(owners, ev.net_offx[n])
-        ys = ev._pin_y(owners, ev.net_offy[n])
-        own_pos = np.where(owners == soft_global_idx)[0]
-        if own_pos.size == 0:
-            continue
-        i = int(own_pos[0])
-        k = owners.size
-        px = (xs.sum() - xs[i]) / (k - 1)
-        py = (ys.sum() - ys[i]) / (k - 1)
-        w = ev._net_weight[n] / (k - 1)
-        sum_x += w * px
-        sum_y += w * py
-        total_w += w
-    if total_w <= 0:
-        return None
-    return float(sum_x / total_w), float(sum_y / total_w)
-
-
-def lahc_polish(
-    ev: FastEvaluator,
-    list_len: int = 100,
+def pt_polish(
+    benchmark: Benchmark,
+    init_positions: torch.Tensor,
+    *,
+    n_replicas: int = 32,
+    T_min: float = 5e-5,
+    T_max: float = 5e-3,
+    sigma_frac_min: float = 0.005,
+    sigma_frac_max: float = 0.05,
+    swap_every: int = 20,
+    overlap_lambda: float = 50.0,
     time_budget_s: float = 600.0,
-    move_radius_frac: float = 0.06,
-    soft_move_radius_frac: float = 0.03,
-    soft_centroid_prob: float = 0.50,
-    swap_prob: float = 0.30,
-    soft_prob: float = 0.40,
-    decongest_prob: float = 0.0,         # disabled: didn't outperform random LAHC + LK
-    n_swap_neighbors: int = 12,
-    n_decongest_top_cells: int = 16,
-    decongest_refresh_every: int = 100,  # recompute hot-cell list every N iters
     seed: int = 0,
     verbose: bool = True,
-    log_interval_s: float = 20.0,
-):
-    rng = np.random.default_rng(seed)
-    cur_cost = ev.proxy_cost()["proxy_cost"]
-    best_cost = cur_cost
-    best_pos = ev.positions.copy()
-    history = [cur_cost] * list_len
+    log_interval_s: float = 15.0,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, float]:
+    """GPU-batched Parallel Tempering polish.
+
+    K replicas on the GPU as a [K, n_macros, 2] tensor, each running Metropolis
+    MH on the TILOS proxy surrogate (wl_norm + 0.5*density + 0.5*rudy) plus a
+    hard-overlap penalty. Per-step move: each replica picks one random movable
+    macro and applies a Gaussian perturbation scaled by its own temperature.
+    Every `swap_every` steps, propose adjacent-rung position swaps with the
+    standard Metropolis-Hastings replica-exchange criterion.
+
+    Returns (best_positions[n_macros, 2] on CPU, best_cost). Hard macros are
+    NOT relegalized — the caller is responsible for shelf-pack + oracle scoring.
+    """
+    if device is None:
+        device = _device()
+
+    torch.manual_seed(seed)
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+
+    K = n_replicas
+    n_hard = benchmark.num_hard_macros
+    n_macros = benchmark.num_macros
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    sizes_all = benchmark.macro_sizes.to(device).float()
+    sizes_hard = sizes_all[:n_hard]
+    movable_t = benchmark.get_movable_mask().to(device)
+    half_w_t = sizes_all[:, 0] / 2.0
+    half_h_t = sizes_all[:, 1] / 2.0
+    owner_idx, pin_off, net_id, n_nets = _build_pin_tensors(benchmark, device)
+    port_pos = benchmark.port_positions.to(device).float()
+    init_full_t = init_positions.to(device).float()
+    grid_col = int(benchmark.grid_cols)
+    grid_row = int(benchmark.grid_rows)
+    h_per_um = float(benchmark.hroutes_per_micron)
+    v_per_um = float(benchmark.vroutes_per_micron)
+    gamma_t = torch.tensor(0.05, device=device, dtype=torch.float32)
+
+    log_T = torch.linspace(
+        math.log(T_min), math.log(T_max), K, device=device, dtype=torch.float32
+    )
+    temps = torch.exp(log_T)  # [K]
+    log_sig = torch.linspace(
+        math.log(sigma_frac_min), math.log(sigma_frac_max), K,
+        device=device, dtype=torch.float32,
+    )
+    sigmas_frac = torch.exp(log_sig)
+    sigma_x = sigmas_frac * cw
+    sigma_y = sigmas_frac * ch
+
+    # Initial replica population: copies of init + small per-replica jitter.
+    pop = init_full_t.unsqueeze(0).expand(K, n_macros, 2).clone()
+    jitter = torch.randn(K, n_macros, 2, generator=rng, device=device)
+    jitter[..., 0] = jitter[..., 0] * (0.25 * sigma_x.view(K, 1))
+    jitter[..., 1] = jitter[..., 1] * (0.25 * sigma_y.view(K, 1))
+    pop = pop + jitter * movable_t.view(1, n_macros, 1).float()
+    pop[..., 0].clamp_(min=half_w_t.unsqueeze(0), max=(cw - half_w_t).unsqueeze(0))
+    pop[..., 1].clamp_(min=half_h_t.unsqueeze(0), max=(ch - half_h_t).unsqueeze(0))
+    fixed_mask = ~movable_t
+    if fixed_mask.any():
+        pop[:, fixed_mask] = init_full_t[fixed_mask]
+
+    def _cost(pop_in: torch.Tensor) -> torch.Tensor:
+        wl_n = tilos_wl_normalized(
+            pop_in, owner_idx, pin_off, net_id, n_nets, port_pos,
+            n_hard, n_macros, gamma_t, cw, ch,
+        )
+        dens = tilos_density_loss(pop_in, sizes_all, grid_col, grid_row, cw, ch)
+        cong = tilos_rudy_normalized(
+            pop_in, owner_idx, pin_off, net_id, n_nets, port_pos,
+            n_hard, n_macros, grid_col, grid_row, cw, ch,
+            h_per_um, v_per_um, gamma_t, smooth_range=2, k_frac=0.05,
+        )
+        ov = overlap_loss_hard(pop_in[:, :n_hard], sizes_hard)
+        return wl_n + 0.5 * dens + 0.5 * cong + overlap_lambda * ov
+
+    with torch.no_grad():
+        cur_cost = _cost(pop)
+        best_k = int(torch.argmin(cur_cost).item())
+        best_cost = float(cur_cost[best_k].item())
+        best_pos = pop[best_k].clone()
+
+    movable_indices = torch.nonzero(movable_t, as_tuple=False).flatten()
+    n_movable = int(movable_indices.numel())
+    if n_movable == 0:
+        if verbose:
+            print("  [PT] no movable macros; returning init", flush=True)
+        return init_full_t.cpu(), best_cost
+
+    batch_idx = torch.arange(K, device=device)
     t0 = time.time()
     last_log = t0
-    it = 0
-    # Hot-cell cache for decongest proposals
-    hot_cells: List[Tuple[int, int, float]] = []   # (row, col, heat)
-    hot_macros: List[int] = []                       # macros contributing to hot cells
-    last_hot_refresh = -1
+    step = 0
+    n_swap_attempt = 0
+    n_swap_accept = 0
+    n_move_attempt = 0
+    n_move_accept = 0
+
     while time.time() - t0 < time_budget_s:
-        if verbose and time.time() - last_log >= log_interval_s:
-            print(f"  [LAHC] t={time.time()-t0:.0f}s it={it} cur={cur_cost:.4f} best={best_cost:.4f}", flush=True)
-            last_log = time.time()
-        # Periodically refresh the hot-cell list and the macros contributing to them
-        if it - last_hot_refresh >= decongest_refresh_every:
-            cong = _smoothed_congestion_grid(ev)
-            flat = cong.ravel()
-            n_top = min(n_decongest_top_cells, max(1, int(flat.size * 0.05)))
-            top_idx = np.argpartition(-flat, n_top - 1)[:n_top]
-            hot_cells = [((int(idx) // ev.grid_col), (int(idx) % ev.grid_col), float(flat[idx])) for idx in top_idx]
-            hot_macro_scores: Dict[int, float] = {}
-            for net_idx in range(ev.n_nets):
-                ymin_c, xmin_c = ev._grid_cell(ev._net_xmin[net_idx], ev._net_ymin[net_idx])
-                ymax_c, xmax_c = ev._grid_cell(ev._net_xmax[net_idx], ev._net_ymax[net_idx])
-                stress = 0.0
-                for (r_h, c_h, h_val) in hot_cells:
-                    if ymin_c <= r_h <= ymax_c and xmin_c <= c_h <= xmax_c:
-                        stress += h_val
-                if stress > 0:
-                    for o in ev.net_owner[net_idx]:
-                        o = int(o)
-                        if o < ev.n_hard and ev.movable[o]:
-                            hot_macro_scores[o] = hot_macro_scores.get(o, 0.0) + stress
-            if hot_macro_scores:
-                # Top-50 hottest hard macros
-                hot_macros = [m for m, _ in sorted(hot_macro_scores.items(), key=lambda x: -x[1])[:50]]
-            else:
-                hot_macros = []
-            last_hot_refresh = it
-        r = rng.random()
-        do_swap = r < swap_prob
-        do_soft = (r >= swap_prob) and (r < swap_prob + soft_prob) and (ev.n_soft > 0)
-        do_decongest = (
-            (r >= swap_prob + soft_prob)
-            and (r < swap_prob + soft_prob + decongest_prob)
-            and (len(hot_macros) > 0)
+        with torch.no_grad():
+            # 1. Per-replica move proposal: pick one movable macro, Gaussian-perturb.
+            pick = torch.randint(0, n_movable, (K,), generator=rng, device=device)
+            move_idx = movable_indices[pick]  # [K]
+            delta = torch.randn(K, 2, generator=rng, device=device)
+            delta[:, 0] = delta[:, 0] * sigma_x
+            delta[:, 1] = delta[:, 1] * sigma_y
+            old_xy = pop[batch_idx, move_idx].clone()
+            hw = half_w_t[move_idx]
+            hh = half_h_t[move_idx]
+            new_xy = old_xy + delta
+            new_xy[:, 0] = new_xy[:, 0].clamp(min=hw, max=cw - hw)
+            new_xy[:, 1] = new_xy[:, 1].clamp(min=hh, max=ch - hh)
+            pop[batch_idx, move_idx] = new_xy
+
+            # 2. Evaluate cost for all K replicas in one batched forward pass.
+            new_cost = _cost(pop)
+            d_cost = new_cost - cur_cost
+
+            # 3. Metropolis accept per replica.
+            rand_u = torch.rand(K, generator=rng, device=device)
+            mh_ratio = torch.exp((-d_cost / temps).clamp(max=0.0))
+            accept = (d_cost < 0) | (rand_u < mh_ratio)
+            reject = ~accept
+            if reject.any():
+                rej_idx = batch_idx[reject]
+                pop[rej_idx, move_idx[reject]] = old_xy[reject]
+            cur_cost = torch.where(accept, new_cost, cur_cost)
+            n_move_attempt += K
+            n_move_accept += int(accept.sum().item())
+
+            # 4. Track global best across all replicas.
+            cur_best_k = int(torch.argmin(cur_cost).item())
+            cur_best = float(cur_cost[cur_best_k].item())
+            if cur_best < best_cost:
+                best_cost = cur_best
+                best_pos = pop[cur_best_k].clone()
+
+            # 5. Replica-exchange swap every `swap_every` steps.
+            if (step + 1) % swap_every == 0 and K > 1:
+                start = (step // swap_every) & 1
+                cur_cost_cpu = cur_cost  # already on device; we use scalar ops below
+                for i in range(start, K - 1, 2):
+                    j = i + 1
+                    log_ratio = (1.0 / temps[i] - 1.0 / temps[j]) * (cur_cost_cpu[i] - cur_cost_cpu[j])
+                    u = torch.rand((), generator=rng, device=device)
+                    if u < torch.exp(log_ratio.clamp(max=0.0)):
+                        tmp_pos = pop[i].clone()
+                        pop[i] = pop[j]
+                        pop[j] = tmp_pos
+                        ci = cur_cost[i].clone()
+                        cur_cost[i] = cur_cost[j]
+                        cur_cost[j] = ci
+                        n_swap_accept += 1
+                    n_swap_attempt += 1
+
+            step += 1
+
+            if verbose and time.time() - last_log >= log_interval_s:
+                acc = n_move_accept / max(n_move_attempt, 1)
+                sacc = n_swap_accept / max(n_swap_attempt, 1)
+                print(
+                    f"  [PT] t={time.time()-t0:.0f}s step={step} "
+                    f"best={best_cost:.4f} cur_min={float(cur_cost.min().item()):.4f} "
+                    f"cur_max={float(cur_cost.max().item()):.4f} "
+                    f"acc={acc:.2%} swap_acc={sacc:.2%}",
+                    flush=True,
+                )
+                last_log = time.time()
+
+    if verbose:
+        print(
+            f"  [PT] done: steps={step} best={best_cost:.4f} "
+            f"move_acc={n_move_accept/max(n_move_attempt,1):.2%} "
+            f"swap_acc={n_swap_accept/max(n_swap_attempt,1):.2%}",
+            flush=True,
         )
-        if do_swap:
-            i = int(rng.integers(0, ev.n_hard))
-            if not ev.movable[i]:
-                it += 1
-                continue
-            d = np.linalg.norm(ev.positions[:ev.n_hard] - ev.positions[i], axis=1)
-            d[i] = np.inf
-            cands = np.argsort(d)[:n_swap_neighbors]
-            j = int(cands[int(rng.integers(0, cands.size))])
-            if not ev.movable[j] or not _swap_legal(ev, i, j):
-                it += 1
-                continue
-            ev.swap_macros(i, j)
-            cand = ev.proxy_cost()["proxy_cost"]
-            idx_h = it % list_len
-            if cand < cur_cost or cand < history[idx_h]:
-                cur_cost = cand
-                history[idx_h] = cand
-                if cand < best_cost:
-                    best_cost = cand
-                    best_pos = ev.positions.copy()
-            else:
-                ev.swap_macros(i, j)
-        elif do_soft:
-            i_soft = int(rng.integers(0, ev.n_soft))
-            i = ev.n_hard + i_soft
-            if not ev.movable[i]:
-                it += 1
-                continue
-            ox, oy = ev.positions[i]
-            use_cent = rng.random() < soft_centroid_prob
-            if use_cent:
-                tgt = _soft_centroid_target(ev, i)
-                if tgt is None:
-                    it += 1
-                    continue
-                tx, ty = tgt
-                f = float(rng.uniform(0.05, 0.5))
-                nx = ox + f * (tx - ox)
-                ny = oy + f * (ty - oy)
-            else:
-                rx = soft_move_radius_frac * ev.cw
-                ry = soft_move_radius_frac * ev.ch
-                nx = ox + float(rng.uniform(-rx, rx))
-                ny = oy + float(rng.uniform(-ry, ry))
-            nx = max(ev.half[i, 0], min(ev.cw - ev.half[i, 0], nx))
-            ny = max(ev.half[i, 1], min(ev.ch - ev.half[i, 1], ny))
-            ev.move_macro(i, nx, ny, is_hard=False)
-            cand = ev.proxy_cost()["proxy_cost"]
-            idx_h = it % list_len
-            if cand < cur_cost or cand < history[idx_h]:
-                cur_cost = cand
-                history[idx_h] = cand
-                if cand < best_cost:
-                    best_cost = cand
-                    best_pos = ev.positions.copy()
-            else:
-                ev.move_macro(i, ox, oy, is_hard=False)
-        elif do_decongest:
-            # Pick a hard macro contributing to a hot cell; propose moving it
-            # AWAY from the hot cell centroid (with small random jitter so LAHC
-            # can explore around the bias direction).
-            i = int(rng.choice(hot_macros))
-            if not ev.movable[i]:
-                it += 1
-                continue
-            # Hot centroid (heat-weighted)
-            heat_sum = sum(h for _, _, h in hot_cells)
-            if heat_sum <= 0:
-                it += 1
-                continue
-            hot_cx = sum((c + 0.5) * ev.gw * h for _, c, h in hot_cells) / heat_sum
-            hot_cy = sum((r + 0.5) * ev.gh * h for r, _, h in hot_cells) / heat_sum
-            ox, oy = ev.positions[i]
-            # Direction AWAY from hot centroid
-            dx_dir = ox - hot_cx
-            dy_dir = oy - hot_cy
-            norm = math.sqrt(dx_dir * dx_dir + dy_dir * dy_dir) + 1e-9
-            dx_dir /= norm
-            dy_dir /= norm
-            step = move_radius_frac * 0.5 * (ev.cw + ev.ch) * float(rng.uniform(0.3, 1.0))
-            # Add some lateral noise so we don't always move along the same line
-            jitter_x = float(rng.uniform(-0.3, 0.3)) * step
-            jitter_y = float(rng.uniform(-0.3, 0.3)) * step
-            nx = ox + dx_dir * step + jitter_x
-            ny = oy + dy_dir * step + jitter_y
-            nx = max(ev.half[i, 0], min(ev.cw - ev.half[i, 0], nx))
-            ny = max(ev.half[i, 1], min(ev.ch - ev.half[i, 1], ny))
-            if not _slide_legal(ev, i, nx, ny):
-                it += 1
-                continue
-            ev.move_macro(i, nx, ny, is_hard=True)
-            cand = ev.proxy_cost()["proxy_cost"]
-            idx_h = it % list_len
-            if cand < cur_cost or cand < history[idx_h]:
-                cur_cost = cand
-                history[idx_h] = cand
-                if cand < best_cost:
-                    best_cost = cand
-                    best_pos = ev.positions.copy()
-            else:
-                ev.move_macro(i, ox, oy, is_hard=True)
-        else:
-            i = int(rng.integers(0, ev.n_hard))
-            if not ev.movable[i]:
-                it += 1
-                continue
-            rx = move_radius_frac * ev.cw
-            ry = move_radius_frac * ev.ch
-            ox, oy = ev.positions[i]
-            nx = max(ev.half[i, 0], min(ev.cw - ev.half[i, 0], ox + float(rng.uniform(-rx, rx))))
-            ny = max(ev.half[i, 1], min(ev.ch - ev.half[i, 1], oy + float(rng.uniform(-ry, ry))))
-            if not _slide_legal(ev, i, nx, ny):
-                it += 1
-                continue
-            ev.move_macro(i, nx, ny, is_hard=True)
-            cand = ev.proxy_cost()["proxy_cost"]
-            idx_h = it % list_len
-            if cand < cur_cost or cand < history[idx_h]:
-                cur_cost = cand
-                history[idx_h] = cand
-                if cand < best_cost:
-                    best_cost = cand
-                    best_pos = ev.positions.copy()
-            else:
-                ev.move_macro(i, ox, oy, is_hard=True)
-        it += 1
-    if not np.array_equal(ev.positions, best_pos):
-        ev.restore(best_pos)
-    return {"proxy_cost": best_cost, "iters": it}
+    return best_pos.cpu(), best_cost
