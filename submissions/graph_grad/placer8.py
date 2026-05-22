@@ -964,12 +964,12 @@ class GraphGradPlacer:
         n_epochs: int = 8,
         steps_per_epoch: int = 500,
         grid_res: int = 32,
-        time_budget_s: float = 3300.0,     # 50 min
+        time_budget_s: float = 3000.0,     # 50 min
         verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
         soft_steps: int = 5000,            # Total Adam steps (was 3000)
         soft_lr: float = 0.01,
-        n_restarts: int = 0,               # Independent restarts with different RNG seeds
+        n_restarts: int = 1,               # Independent restarts with different RNG seeds
         # LAHC tail stage (runs after analytical placement; bit-exact incremental
         # proxy via FastEvaluator). Does NOT change koral's placement process —
         # it only polishes the result. Disable with run_lahc=False.
@@ -978,6 +978,15 @@ class GraphGradPlacer:
         lahc_list_len: int = 100,
         lahc_min_budget_s: float = 60.0,
         lahc_log_interval_s: float = 15.0,
+        # Top-K oracle scoring early-exit: stop scoring candidates once we've
+        # had `koral_scoring_plateau_threshold` consecutive scores without
+        # improvement. Floor of `koral_scoring_min_candidates` always scored.
+        # Crucial on large designs (ibm17-18) where each oracle call costs 15s+.
+        koral_scoring_plateau_threshold: int = 4,
+        koral_scoring_min_candidates: int = 8,
+        # Cap on the top-K candidates scored against the oracle in soft-only
+        # mode. Lower = faster (each oracle call is 5-15s on big designs).
+        koral_k_eval: int = 24,
     ):
         self.seed = seed
         self.pop_size = pop_size
@@ -995,6 +1004,9 @@ class GraphGradPlacer:
         self.lahc_list_len = lahc_list_len
         self.lahc_min_budget_s = lahc_min_budget_s
         self.lahc_log_interval_s = lahc_log_interval_s
+        self.koral_scoring_plateau_threshold = koral_scoring_plateau_threshold
+        self.koral_scoring_min_candidates = koral_scoring_min_candidates
+        self.koral_k_eval = koral_k_eval
 
     def _log(self, msg: str):
         if self.verbose:
@@ -1268,18 +1280,23 @@ class GraphGradPlacer:
                 h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
             )
             surr = wl_n + 0.5 * dens + 0.5 * cong
-        k_eval = min(K, max(8, K // 2))
+        k_eval = min(K, self.koral_k_eval)
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
 
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
+        plateau_th = self.koral_scoring_plateau_threshold
+        min_scored = max(self.koral_scoring_min_candidates, plateau_th)
         self._log(
-            f"top-K oracle scoring: {len(top_idx)} candidates  "
-            f"(each compute_proxy_cost call can take 5-15s on large designs)"
+            f"top-K oracle scoring: up to {len(top_idx)} candidates  "
+            f"(plateau early-exit after {plateau_th} non-improving scores, "
+            f"min {min_scored} always scored)"
         )
         _score_t0 = time.time()
         _score_last_log = _score_t0
+        no_improve = 0
+        scored_total = 0
         for _i, k in enumerate(top_idx):
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
             pos_full = self._clip_soft_to_canvas(pos_full, benchmark, n_hard, cw, ch)
@@ -1287,17 +1304,30 @@ class GraphGradPlacer:
             if plc is None:
                 continue
             c = compute_proxy_cost(full_t, benchmark, plc)
-            if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
+            scored_total = _i + 1
+            improved = c["overlap_count"] == 0 and c["proxy_cost"] < best_cost
+            if improved:
                 best_cost = c["proxy_cost"]
                 best_full = full_t
+                no_improve = 0
+            else:
+                no_improve += 1
             # Heartbeat: print at least every 15s so it doesn't look stuck.
             if self.verbose and (time.time() - _score_last_log >= 15.0 or _i == len(top_idx) - 1):
                 self._log(
-                    f"  scored {_i+1}/{len(top_idx)} "
+                    f"  scored {scored_total}/{len(top_idx)} "
                     f"elapsed={time.time()-_score_t0:.0f}s "
-                    f"best_so_far={best_cost:.4f}"
+                    f"best_so_far={best_cost:.4f}  no_improve={no_improve}"
                 )
                 _score_last_log = time.time()
+            # Plateau early-exit (after we've scored at least min_scored)
+            if scored_total >= min_scored and no_improve >= plateau_th:
+                self._log(
+                    f"  plateau: {no_improve} non-improving candidates in a row; "
+                    f"stopping early at {scored_total}/{len(top_idx)} "
+                    f"(saved ~{(len(top_idx)-scored_total)*((time.time()-_score_t0)/scored_total):.0f}s)"
+                )
+                break
         # Anchor safety net
         full_anc = torch.zeros(n_macros, 2)
         full_anc[:n_hard] = hard_legal_t.cpu()
