@@ -516,9 +516,9 @@ class GraphGradPlacer:
         lk_budget_s: float = 150.0,
         # Phase 4 — Hierarchical regional LAHC
         run_regional: bool = True,
-        regional_grid_sizes: Tuple[int, ...] = (3, 5, 7, 9),
+        regional_grid_sizes: Tuple[int, ...] = (3, 5, 7),
         regional_min_macros: int = 30,
-        regional_budget_s: float = 400.0,
+        regional_budget_s: float = 200.0,
         # Phase 5 — Global LAHC
         run_lahc: bool = True,
         lahc_list_len: int = 100,
