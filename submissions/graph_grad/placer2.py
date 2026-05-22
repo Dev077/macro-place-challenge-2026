@@ -501,7 +501,7 @@ class GraphGradPlacer:
         gp_budget_s: float = 300.0,
         # Phase α₂ (koral soft-only Adam)
         run_soft_adam: bool = True,
-        soft_K: int = 24,
+        soft_K: int = 16,
         soft_steps: int = 2500,
         soft_lr: float = 0.01,
         soft_budget_s: float = 220.0,
