@@ -1200,12 +1200,12 @@ class LKPlacer:
     def __init__(
         self,
         seed: int = 42,
-        time_budget_s: float = 3000.0,
+        time_budget_s: float = 3300.0,
         # Phase α₁ (electrostatic GP)
         run_gp: bool = True,
         gp_pop_size: int = 16,
         gp_steps: int = 20000,
-        gp_budget_s: float = 300.0,
+        gp_budget_s: float = 600.0,
         # Phase α₂ (true-cost subgradient)
         run_alpha2: bool = True,
         alpha2_budget_s: float = 150.0,
