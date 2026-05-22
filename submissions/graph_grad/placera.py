@@ -475,7 +475,7 @@ def _load_lk_gp():
 
 
 def _load_lk_placer():
-    spec = importlib.util.spec_from_file_location("_koral_lk_placer", str(_lk_dir() / "placer.py"))
+    spec = importlib.util.spec_from_file_location("_koral_lk_placer", str(_lk_dir() / "placer2.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
