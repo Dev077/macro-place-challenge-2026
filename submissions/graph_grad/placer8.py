@@ -962,8 +962,8 @@ class GraphGradPlacer:
         seed: int = 42,
         pop_size: int = 96,                # 3× the original to use Blackwell VRAM
         n_epochs: int = 8,
-        steps_per_epoch: int = 5000,
-        grid_res: int = 64,
+        steps_per_epoch: int = 500,
+        grid_res: int = 32,
         time_budget_s: float = 3000.0,     # 50 min
         verbose: bool = True,
         lock_hard: bool = True,            # Lock hard macros at legalized initial.plc
