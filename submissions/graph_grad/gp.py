@@ -300,69 +300,6 @@ def rudy_demand(
     return v_demand, h_demand
 
 
-def macro_routing_demand(
-    pop_hard: torch.Tensor,         # [K, n_hard, 2]
-    sizes_hard: torch.Tensor,       # [n_hard, 2]
-    grid_col: int, grid_row: int,
-    cw: float, ch: float,
-    h_alloc: float, v_alloc: float,
-    h_per_um: float, v_per_um: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-cell macro routing allocation, normalized by track supply.
-
-    Mirrors PlacementCost._add_macro_route in spirit:
-        v_macro_raw[r,c] = Σ_n  x_ov[n,c] · 1{macro n overlaps row r} · v_alloc
-        h_macro_raw[r,c] = Σ_n  y_ov[n,r] · 1{macro n overlaps col c} · h_alloc
-    then normalize by (grid_w · v_per_um) and (grid_h · h_per_um) so the result
-    is on the same scale as the pin-RUDY tensors returned by `rudy_demand`.
-
-    The hard step 1{·} is replaced with a soft ramp `clamp(overlap/grid_size, 0, 1)`
-    that is smooth everywhere and identical to the hard step for interior cells
-    (where overlap == grid_size).  Because the proxy's odd "partial-cell"
-    correction zeros the top partial row when both ends are partial, this linear
-    ramp ends up matching the proxy in the 50/50-split case and is in the right
-    direction everywhere else — gradients always point macros away from
-    routing-blocking positions.
-    """
-    K, N, _ = pop_hard.shape
-    grid_w = cw / grid_col
-    grid_h = ch / grid_row
-    device = pop_hard.device
-    dtype = pop_hard.dtype
-    if N == 0 or (h_alloc == 0.0 and v_alloc == 0.0):
-        return (
-            torch.zeros(K, grid_row, grid_col, device=device, dtype=dtype),
-            torch.zeros(K, grid_row, grid_col, device=device, dtype=dtype),
-        )
-    col_l = torch.arange(grid_col, device=device, dtype=dtype) * grid_w
-    col_r = col_l + grid_w
-    row_b = torch.arange(grid_row, device=device, dtype=dtype) * grid_h
-    row_t = row_b + grid_h
-    x = pop_hard[..., 0]
-    y = pop_hard[..., 1]
-    hw = sizes_hard[:, 0] / 2
-    hh = sizes_hard[:, 1] / 2
-    macro_l = (x - hw.unsqueeze(0)).unsqueeze(-1)
-    macro_r = (x + hw.unsqueeze(0)).unsqueeze(-1)
-    macro_b_ = (y - hh.unsqueeze(0)).unsqueeze(-1)
-    macro_t_ = (y + hh.unsqueeze(0)).unsqueeze(-1)
-    col_lb = col_l.view(1, 1, grid_col)
-    col_rb = col_r.view(1, 1, grid_col)
-    row_bb = row_b.view(1, 1, grid_row)
-    row_tb = row_t.view(1, 1, grid_row)
-    x_ov = (torch.min(macro_r, col_rb) - torch.max(macro_l, col_lb)).clamp(min=0.0)  # [K, N, C]
-    y_ov = (torch.min(macro_t_, row_tb) - torch.max(macro_b_, row_bb)).clamp(min=0.0)  # [K, N, R]
-    row_pres = (y_ov / grid_h).clamp(min=0.0, max=1.0)
-    col_pres = (x_ov / grid_w).clamp(min=0.0, max=1.0)
-    # v_macro_raw[K, R, C] = Σ_n x_ov[K,n,C] * row_pres[K,n,R] * v_alloc
-    v_macro = torch.einsum("knx,kny->kyx", x_ov, row_pres) * v_alloc
-    # h_macro_raw[K, R, C] = Σ_n col_pres[K,n,C] * y_ov[K,n,R] * h_alloc
-    h_macro = torch.einsum("knx,kny->kyx", col_pres, y_ov) * h_alloc
-    grid_v_routes = grid_w * v_per_um
-    grid_h_routes = grid_h * h_per_um
-    return v_macro / grid_v_routes, h_macro / grid_h_routes
-
-
 def _smooth_1d_along_axis(grid: torch.Tensor, smooth_range: int, axis: int) -> torch.Tensor:
     """Apply TILOS-style 1-D smoothing along the chosen axis (matches PlacementCost).
     Each cell's value is divided by window count then spread into its window neighbours.
@@ -461,22 +398,16 @@ def focused_congestion_loss(
     h_demand: torch.Tensor,
     smooth_range: int,
     top_k_frac: float = 0.05,
-    v_macro: Optional[torch.Tensor] = None,
-    h_macro: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Focused-congestion loss matching PlacementCost._congestion_cost.
+    """Legacy focused-congestion (local-gradient).
 
-    `v_demand`/`h_demand` are the smoothed pin-RUDY tensors; `v_macro`/`h_macro`
-    are the (un-smoothed) macro routing allocation tensors.  In the proxy
-    pin demand is smoothed but macro allocation is added raw — we mirror that.
+    Kept for the cong_w warm-up phase.  See focused_electrostatic_cong_loss
+    below for the global-gradient Poisson version that drives the
+    main congestion reduction.
     """
     K = v_demand.shape[0]
     v_s = _smooth_1d_along_axis(v_demand, smooth_range, axis=0)
     h_s = _smooth_1d_along_axis(h_demand, smooth_range, axis=1)
-    if v_macro is not None:
-        v_s = v_s + v_macro
-    if h_macro is not None:
-        h_s = h_s + h_macro
     combined = torch.cat([v_s.reshape(K, -1), h_s.reshape(K, -1)], dim=1)  # [K, 2*R*C]
     n = combined.shape[1]
     k = max(1, int(n * top_k_frac))
@@ -491,8 +422,6 @@ def focused_electrostatic_cong_loss(
     smooth_range: int,
     top_k_frac: float = 0.05,
     push: float = 1.0,
-    v_macro: Optional[torch.Tensor] = None,
-    h_macro: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Poisson-solved focused congestion loss — the congestion-side innovation.
 
@@ -513,10 +442,6 @@ def focused_electrostatic_cong_loss(
     """
     v_s = _smooth_1d_along_axis(v_demand, smooth_range, axis=0)  # [K, R, C]
     h_s = _smooth_1d_along_axis(h_demand, smooth_range, axis=1)
-    if v_macro is not None:
-        v_s = v_s + v_macro
-    if h_macro is not None:
-        h_s = h_s + h_macro
     combined = v_s + h_s   # [K, R, C] — fused congestion grid
     K, R, C = combined.shape
     flat = combined.reshape(K, -1)
@@ -617,21 +542,6 @@ def run_global_placement(
     port_pos = benchmark.port_positions.to(device).float() if benchmark.port_positions.shape[0] > 0 else torch.zeros(0, 2, device=device)
     owner_idx, pin_off, net_id, n_nets = _build_pin_tensors(benchmark, device)
 
-    # Macro routing allocation (the dominant proxy-congestion term on macro-heavy
-    # designs).  Without this in the loss, GP places macros to minimise pin-RUDY
-    # only — which clusters them, blocking tracks they sit on and creating the
-    # corner-cluster pathology seen on ibm18.
-    h_alloc = 0.0
-    v_alloc = 0.0
-    if plc is not None:
-        try:
-            h_alloc, v_alloc = plc.get_macro_routing_allocation()
-            h_alloc = float(h_alloc)
-            v_alloc = float(v_alloc)
-        except Exception:
-            h_alloc = float(getattr(plc, "hrouting_alloc", 0.0))
-            v_alloc = float(getattr(plc, "vrouting_alloc", 0.0))
-
     # Weights per net — pull from plc if available (matches PlacementCost normalization)
     weights_per_net = None
     n_nets_norm = n_nets
@@ -701,20 +611,12 @@ def run_global_placement(
         # ── Density via focused Poisson ──
         dens_grid = bilinear_density(pop, sizes, grid_col, grid_row, cw, ch)
         dens_loss = focused_electrostatic_loss(dens_grid, top_k_density, push_factor)  # [K]
-        # ── Congestion via RUDY (pin) + macro routing allocation ──
+        # ── Congestion via RUDY ──
         v_dem, h_dem = rudy_demand(
             pop, owner_idx, pin_off, net_id, n_nets, port_pos, n_macros,
             grid_col, grid_row, cw, ch, h_per_um, v_per_um,
         )
-        v_macro_dem, h_macro_dem = macro_routing_demand(
-            pop[:, :n_hard], sizes_hard,
-            grid_col, grid_row, cw, ch,
-            h_alloc, v_alloc, h_per_um, v_per_um,
-        )
-        cong_loss = focused_congestion_loss(
-            v_dem, h_dem, smooth_range, top_k_cong,
-            v_macro=v_macro_dem, h_macro=h_macro_dem,
-        )  # [K]
+        cong_loss = focused_congestion_loss(v_dem, h_dem, smooth_range, top_k_cong)  # [K]
         # ── Overlap (hard macros) ──
         ov_loss = pairwise_overlap(pop[:, :n_hard], sizes_hard) / (cw * ch)  # normalized
         # ── Total ──
