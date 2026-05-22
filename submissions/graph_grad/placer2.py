@@ -1,69 +1,33 @@
 """
-Graph-Gradient Placer
-=====================
+GraphGradPlacer — Unified best-of-three pipeline.
 
-A GPU-batched **analytical (gradient-based)** macro placer with a graph-aware
-multi-start population, joint hard + soft macro optimization, and a density-
-pressure annealing schedule.  Designed to reach sub-1 proxy cost on the IBM
-benchmarks within the 1 h / benchmark budget on an RTX 6000 Ada.
+Pipeline (target ~800s/benchmark):
+  α₁  Focused-Poisson electrostatic GP                (lk_placer/gp.py)        60s
+  α₂  koral soft-only TILOS-faithful Adam (K=24)      (inline below)          220s
+  α₃  Top-K oracle ranking + anchor safety net        (inline below)           15s
+  1   FastEvaluator build (bit-exact incremental)     (lk_placer/placer.py)    10s
+  2   True-cost numerical subgradient                 (lk_placer/placer.py)    60s
+  3   Lin-Kernighan k-opt swap passes                 (lk_placer/placer.py)   150s
+  4   Hierarchical regional LAHC (3×3 → 5×5)          (lk_placer/placer.py)   130s
+  5   Global LAHC polish                              (lk_placer/placer.py)   130s
 
-Why analytical, not discrete search
------------------------------------
-On these benchmarks, ``initial.plc``'s wirelength is already near-optimal —
-the entire path to sub-1 is reducing **density** and **congestion**, which
-means *rearranging* macros to spread better, not minimizing wirelength.  A
-smooth gradient-based objective with an explicit density-overshoot term can
-do this directly.  A discrete GA (my earlier graph_evo placer) ends up
-optimizing wirelength and oscillating around the anchor.
+Class name `GraphGradPlacer` is preserved so the evaluation harness picks it up.
 
-Innovations vs. the obvious "DREAMPlace clone"
-----------------------------------------------
-1. **Joint hard + soft optimization.**  Soft macros (standard-cell clusters)
-   are included as free position variables in the same Adam optimizer, with
-   *no* overlap constraint (they're allowed to overlap by problem definition).
-   They contribute to wirelength (as net endpoints) and to density (their
-   area lands in grid cells).  This is what the SA baseline does sequentially
-   between iterations; we do it jointly on GPU.  Critically, this is what
-   lets the density-pressure schedule reduce density without destroying WL —
-   the optimizer can shift *both* hard *and* soft cells to spread the layout.
-2. **Graph-aware diverse seeds.**  Population spans legalized initial.plc,
-   Fiedler spectral embedding, k-means cluster placement, force-directed
-   random starts, and jittered hybrids.  All K=32 evolve in parallel as a
-   single ``[K, N, 2]`` tensor.
-3. **Density-pressure annealing.**  α_density: 0.01 → 10, γ_HPWL: 2.0 → 0.1.
-   Starts permissive (let WL minimize), ends strict (force density down).
-4. **Periodic hard-macro projection** every epoch — gradient descent on a
-   smooth landscape between projections back to the non-overlap manifold.
-5. **True-cost selection.**  Final pick across K candidates by the real
-   ``plc.get_cost()``.
-
-Pipeline
---------
-1. Build pin-level hypergraph + clique-expanded hard-macro pair graph.
-2. Generate K diverse seeds (initial.plc, Fiedler, k-means, FD-random, jitter).
-3. Stack as ``[K, N, 2]`` on GPU, optimize jointly with Adam.
-4. Anneal γ (WAHPWL smoothing) and α (density / overlap weights) over 8 epochs
-   × 500 steps.
-5. Project hard macros to non-overlapping at every epoch boundary.
-6. Final legalize + true-cost-best selection across the population.
-
-Usage
------
-    uv run evaluate submissions/graph_grad/placer.py -b ibm01
-    uv run evaluate submissions/graph_grad/placer.py --all
+Every phase oracle-verifies via `compute_proxy_cost` and only commits zero-overlap
+results; the legalized initial.plc anchor is the floor — if no phase beats it,
+the anchor is returned.
 """
-
 from __future__ import annotations
 
+import importlib.util
 import math
 import random
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from macro_place.benchmark import Benchmark
 
@@ -112,24 +76,12 @@ def _load_plc(name: str):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Graph extraction (pin-level hypergraph + clique-expanded pair graph)
+# Pin tensors (for soft-only Adam phase)
 # ────────────────────────────────────────────────────────────────────────────
 
 
 def _build_pin_tensors(benchmark: Benchmark, device: torch.device):
-    """
-    Flatten net hypergraph into 1-D tensors over pins.
-
-    owner_idx[e] ∈ [0, n_hard)            → hard macro index
-                 ∈ [n_hard, n_macros)      → soft macro index
-                 ∈ [n_macros, n_macros + n_ports) → I/O port index
-    pin_off[e]   = (dx, dy) offset of pin from owner centre
-    net_id[e]    = which net the pin belongs to
-    """
     n_hard = benchmark.num_hard_macros
-    n_macros = benchmark.num_macros
-    n_ports = benchmark.port_positions.shape[0]
-
     owner_list, off_list, net_list = [], [], []
     nid = 0
     for pins in benchmark.net_pin_nodes:
@@ -145,7 +97,7 @@ def _build_pin_tensors(benchmark: Benchmark, device: torch.device):
                 else:
                     ox, oy = 0.0, 0.0
             else:
-                ox, oy = 0.0, 0.0  # soft / port: pin at centre
+                ox, oy = 0.0, 0.0
             owner_list.append(o)
             off_list.append([ox, oy])
             net_list.append(nid)
@@ -156,103 +108,8 @@ def _build_pin_tensors(benchmark: Benchmark, device: torch.device):
     return owner_idx, pin_off, net_id, nid
 
 
-def _build_pair_graph(benchmark: Benchmark) -> Tuple[np.ndarray, np.ndarray]:
-    """Hard-macro clique-expanded pair graph (for spectral seeding)."""
-    n_hard = benchmark.num_hard_macros
-    edge_w: dict = {}
-    for nodes in benchmark.net_nodes:
-        hard = [int(x) for x in nodes.tolist() if int(x) < n_hard]
-        if len(hard) < 2:
-            continue
-        w = 1.0 / (len(hard) - 1)
-        hard.sort()
-        for i in range(len(hard)):
-            for j in range(i + 1, len(hard)):
-                key = (hard[i], hard[j])
-                edge_w[key] = edge_w.get(key, 0.0) + w
-    if not edge_w:
-        return np.zeros((0, 2), dtype=np.int64), np.zeros((0,), dtype=np.float32)
-    edges = np.array(list(edge_w.keys()), dtype=np.int64)
-    weights = np.array([edge_w[k] for k in edge_w.keys()], dtype=np.float32)
-    return edges, weights
-
-
-def _spectral_layout(
-    edges: np.ndarray,
-    weights: np.ndarray,
-    n: int,
-    cw: float,
-    ch: float,
-    sizes: np.ndarray,
-    seed: int = 0,
-) -> np.ndarray:
-    """Fiedler-style 2-D embedding, scaled into canvas."""
-    if edges.shape[0] == 0:
-        return _grid_fill(n, cw, ch)
-    try:
-        from scipy.sparse import coo_matrix, csr_matrix
-        from scipy.sparse.linalg import eigsh
-
-        i = np.concatenate([edges[:, 0], edges[:, 1]])
-        j = np.concatenate([edges[:, 1], edges[:, 0]])
-        v = np.concatenate([weights, weights]).astype(np.float64)
-        W = coo_matrix((v, (i, j)), shape=(n, n)).tocsr()
-        d = np.asarray(W.sum(axis=1)).ravel()
-        d[d == 0] = 1e-9
-        d_is = 1.0 / np.sqrt(d)
-        D = csr_matrix(
-            (d_is, (np.arange(n), np.arange(n))), shape=(n, n)
-        )
-        L = csr_matrix(
-            (np.ones(n), (np.arange(n), np.arange(n))), shape=(n, n)
-        ) - D @ W @ D
-        rng = np.random.default_rng(seed)
-        try:
-            vals, vecs = eigsh(L, k=min(3, n - 1), which="SM", v0=rng.random(n))
-        except Exception:
-            vals, vecs = eigsh(L, k=min(3, n - 1), which="SM")
-        order = np.argsort(vals)
-        vecs = vecs[:, order]
-        ex = vecs[:, 1]
-        ey = vecs[:, 2] if vecs.shape[1] > 2 else rng.standard_normal(n)
-        # Random rotation for diversity across seeds
-        theta = rng.uniform(0, 2 * math.pi)
-        c_, s_ = math.cos(theta), math.sin(theta)
-        rx = ex * c_ - ey * s_
-        ry = ex * s_ + ey * c_
-        pos = np.stack([rx, ry], axis=1)
-        for a in (0, 1):
-            lo, hi = float(pos[:, a].min()), float(pos[:, a].max())
-            if hi - lo < 1e-12:
-                pos[:, a] = rng.random(n)
-            else:
-                pos[:, a] = (pos[:, a] - lo) / (hi - lo)
-        half_w = sizes[:, 0] / 2
-        half_h = sizes[:, 1] / 2
-        margin_x = (float(half_w.max()) + 0.05) / cw
-        margin_y = (float(half_h.max()) + 0.05) / ch
-        pos[:, 0] = margin_x + pos[:, 0] * (1 - 2 * margin_x)
-        pos[:, 1] = margin_y + pos[:, 1] * (1 - 2 * margin_y)
-        pos[:, 0] *= cw
-        pos[:, 1] *= ch
-        return pos
-    except Exception:
-        return _grid_fill(n, cw, ch)
-
-
-def _grid_fill(n: int, cw: float, ch: float) -> np.ndarray:
-    cols = max(1, int(math.ceil(math.sqrt(n))))
-    rows = max(1, int(math.ceil(n / cols)))
-    pos = np.zeros((n, 2), dtype=np.float64)
-    for k in range(n):
-        r, c = divmod(k, cols)
-        pos[k, 0] = (c + 0.5) * cw / cols
-        pos[k, 1] = (r + 0.5) * ch / rows
-    return pos
-
-
 # ────────────────────────────────────────────────────────────────────────────
-# Legalization (vectorized push-apart + spiral fallback) — float32-aware
+# Legalization (vectorized push-apart + spiral fallback)
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -396,20 +253,17 @@ def _legalize(
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Differentiable surrogate
+# Differentiable surrogate (TILOS-faithful)
 # ────────────────────────────────────────────────────────────────────────────
 
 
 def _lse_max_per_net(
     x: torch.Tensor, net_id: torch.Tensor, gamma: float, n_nets: int
 ) -> torch.Tensor:
-    """Numerically stable γ·log Σ exp(x/γ), per-net, per-population."""
     K, E = x.shape
     idx = net_id.unsqueeze(0).expand(K, E)
-    # per-net max (stabiliser)
     max_pn = torch.full((K, n_nets), float("-inf"), device=x.device, dtype=x.dtype)
     max_pn.scatter_reduce_(1, idx, x, reduce="amax", include_self=True)
-    # Replace -inf (nets with no pins, should be none) with 0
     max_pn = torch.where(torch.isfinite(max_pn), max_pn, torch.zeros_like(max_pn))
     shifted = x - max_pn.gather(1, idx)
     exp_v = torch.exp(shifted / gamma)
@@ -429,171 +283,23 @@ def wahpwl(
     n_macros: int,
     gamma: float,
 ) -> torch.Tensor:
-    """
-    Population WAHPWL via log-sum-exp.
-
-    pop      : [K, n_macros, 2]   (hard + soft positions; fixed macros are
-                                    locked outside this fn)
-    port_pos : [n_ports, 2]       (fixed I/O ports)
-    Returns  : [K]  smooth HPWL summed across nets
-    """
     K = pop.shape[0]
-    n_ports = port_pos.shape[0]
-    # Augment population with port positions on the right (same for all K)
-    if n_ports > 0:
-        ports_b = port_pos.unsqueeze(0).expand(K, n_ports, 2)
-        owner_pos = torch.cat([pop, ports_b], dim=1)  # [K, n_macros + n_ports, 2]
-    else:
-        owner_pos = pop
-    # Per-pin owner position
-    pin_owner = owner_pos[:, owner_idx, :]  # [K, E, 2]
-    pin_pos = pin_owner + pin_off.unsqueeze(0)  # [K, E, 2]
-    x_pins = pin_pos[..., 0]
-    y_pins = pin_pos[..., 1]
-    lse_max_x = _lse_max_per_net(x_pins, net_id, gamma, n_nets)
-    lse_min_x = -_lse_max_per_net(-x_pins, net_id, gamma, n_nets)
-    lse_max_y = _lse_max_per_net(y_pins, net_id, gamma, n_nets)
-    lse_min_y = -_lse_max_per_net(-y_pins, net_id, gamma, n_nets)
-    hpwl = (lse_max_x - lse_min_x) + (lse_max_y - lse_min_y)  # [K, n_nets]
-    return hpwl.sum(dim=1)
-
-
-def density_top_k(
-    pop: torch.Tensor,
-    sizes: torch.Tensor,
-    grid_res: int,
-    cw: float,
-    ch: float,
-    k_frac: float = 0.1,
-) -> torch.Tensor:
-    """
-    Bilinear-spread macro area into grid cells, then return the **squared sum
-    of the top-K% cell densities**, matching the proxy's top-10% density
-    component closely.
-
-    Differentiable through torch.sort.
-    """
-    K, N, _ = pop.shape
-    cell_w = cw / grid_res
-    cell_h = ch / grid_res
-    cell_idx = torch.arange(grid_res, device=pop.device, dtype=pop.dtype)
-    cell_l = cell_idx * cell_w
-    cell_r = cell_l + cell_w
-    cell_b = cell_idx * cell_h
-    cell_t = cell_b + cell_h
-    x = pop[..., 0]
-    y = pop[..., 1]
-    hw = sizes[:, 0] / 2
-    hh = sizes[:, 1] / 2
-    macro_l = (x - hw.unsqueeze(0)).unsqueeze(-1)
-    macro_r = (x + hw.unsqueeze(0)).unsqueeze(-1)
-    macro_b_ = (y - hh.unsqueeze(0)).unsqueeze(-1)
-    macro_t_ = (y + hh.unsqueeze(0)).unsqueeze(-1)
-    cell_lb = cell_l.view(1, 1, grid_res)
-    cell_rb = cell_r.view(1, 1, grid_res)
-    cell_bb = cell_b.view(1, 1, grid_res)
-    cell_tb = cell_t.view(1, 1, grid_res)
-    x_ov = (torch.min(macro_r, cell_rb) - torch.max(macro_l, cell_lb)).clamp(min=0.0)
-    y_ov = (torch.min(macro_t_, cell_tb) - torch.max(macro_b_, cell_bb)).clamp(min=0.0)
-    density = torch.einsum("knx,kny->kyx", x_ov, y_ov)  # [K, Gy, Gx]
-    cells = density.reshape(K, -1)  # [K, G*G]
-    k_top = max(1, int(cells.shape[1] * k_frac))
-    sorted_d, _ = torch.sort(cells, dim=1, descending=True)
-    # Normalise by cell area so the term scales naturally with macro count
-    cell_area = cell_w * cell_h
-    return sorted_d[:, :k_top].pow(2).sum(dim=1) / (cell_area ** 2)
-
-
-def rudy_congestion(
-    pop: torch.Tensor,
-    owner_idx: torch.Tensor,
-    pin_off: torch.Tensor,
-    net_id: torch.Tensor,
-    n_nets: int,
-    port_pos: torch.Tensor,
-    n_hard: int,
-    n_macros: int,
-    grid_res: int,
-    cw: float,
-    ch: float,
-    k_frac: float = 0.05,
-) -> torch.Tensor:
-    """
-    RUDY-style routing-congestion surrogate.
-
-    For each net we spread its HPWL uniformly across its bounding-box area.
-    Per-cell demand = sum_nets (net wirelength × bbox-cell overlap / bbox area).
-    The penalty returned is the squared sum of the top-K% cells, matching the
-    proxy's ``congestion_cost`` (which is the top-5% routing congestion).
-
-    The forward pass uses hard min/max for the bbox (the subgradient is fine
-    for descent; we already have a separate smooth WAHPWL term doing the
-    long-range wirelength work).  Per-cell overlap is the standard
-    differentiable rectangle-intersection.
-    """
-    K = pop.shape[0]
-    device = pop.device
     n_ports = port_pos.shape[0]
     if n_ports > 0:
         ports_b = port_pos.unsqueeze(0).expand(K, n_ports, 2)
         owner_pos = torch.cat([pop, ports_b], dim=1)
     else:
         owner_pos = pop
-    pin_pos = owner_pos[:, owner_idx, :] + pin_off.unsqueeze(0)  # [K, E, 2]
-    x = pin_pos[..., 0]  # [K, E]
-    y = pin_pos[..., 1]
-    idx = net_id.unsqueeze(0).expand(K, -1)
-    big = 1e9
-    x_max = torch.full((K, n_nets), -big, device=device, dtype=pop.dtype)
-    x_min = torch.full((K, n_nets), big, device=device, dtype=pop.dtype)
-    y_max = torch.full((K, n_nets), -big, device=device, dtype=pop.dtype)
-    y_min = torch.full((K, n_nets), big, device=device, dtype=pop.dtype)
-    x_max.scatter_reduce_(1, idx, x, reduce="amax", include_self=True)
-    x_min.scatter_reduce_(1, idx, x, reduce="amin", include_self=True)
-    y_max.scatter_reduce_(1, idx, y, reduce="amax", include_self=True)
-    y_min.scatter_reduce_(1, idx, y, reduce="amin", include_self=True)
-    bbox_w = (x_max - x_min).clamp(min=1e-3)
-    bbox_h = (y_max - y_min).clamp(min=1e-3)
-    bbox_area = bbox_w * bbox_h
-
-    cell_w = cw / grid_res
-    cell_h = ch / grid_res
-    cell_idx = torch.arange(grid_res, device=device, dtype=pop.dtype)
-    cell_l = cell_idx * cell_w
-    cell_r = cell_l + cell_w
-    cell_b = cell_idx * cell_h
-    cell_t = cell_b + cell_h
-
-    bxl = x_min.unsqueeze(-1)
-    bxr = x_max.unsqueeze(-1)
-    byb = y_min.unsqueeze(-1)
-    byt = y_max.unsqueeze(-1)
-    cell_lb = cell_l.view(1, 1, grid_res)
-    cell_rb = cell_r.view(1, 1, grid_res)
-    cell_bb = cell_b.view(1, 1, grid_res)
-    cell_tb = cell_t.view(1, 1, grid_res)
-    # [K, n_nets, G] each
-    x_ov = (torch.min(bxr, cell_rb) - torch.max(bxl, cell_lb)).clamp(min=0.0)
-    y_ov = (torch.min(byt, cell_tb) - torch.max(byb, cell_bb)).clamp(min=0.0)
-
-    # H-demand contribution per cell: wl_x * x_ov * y_ov / bbox_area
-    # = (bbox_w / bbox_area) * x_ov * y_ov  = (1 / bbox_h) * x_ov * y_ov
-    # Similarly V-demand: 1 / bbox_w * x_ov * y_ov
-    inv_h = (1.0 / bbox_h).unsqueeze(-1)  # [K, n_nets, 1]
-    inv_w = (1.0 / bbox_w).unsqueeze(-1)
-    h_per_net_cell = inv_h * x_ov  # [K, n_nets, Gx]
-    v_per_net_cell = inv_w * x_ov  # [K, n_nets, Gx]  (same shape but different scale)
-    # Outer-product over y_ov to get full 2-D demand tensor, summed over nets:
-    # H[k, gy, gx] = sum_n h_per_net_cell[k, n, gx] * y_ov[k, n, gy]
-    h_demand = torch.einsum("knx,kny->kyx", h_per_net_cell, y_ov)  # [K, Gy, Gx]
-    # V-demand similarly but congestion = max(H, V)
-    v_demand = torch.einsum("knx,kny->kyx", v_per_net_cell, y_ov)
-    cell_cong = torch.maximum(h_demand, v_demand)
-    # Top-K%
-    cells = cell_cong.reshape(K, -1)
-    k_top = max(1, int(cells.shape[1] * k_frac))
-    sorted_c, _ = torch.sort(cells, dim=1, descending=True)
-    return sorted_c[:, :k_top].pow(2).sum(dim=1)
+    pin_owner = owner_pos[:, owner_idx, :]
+    pin_pos = pin_owner + pin_off.unsqueeze(0)
+    x_pins = pin_pos[..., 0]
+    y_pins = pin_pos[..., 1]
+    lse_max_x = _lse_max_per_net(x_pins, net_id, gamma, n_nets)
+    lse_min_x = -_lse_max_per_net(-x_pins, net_id, gamma, n_nets)
+    lse_max_y = _lse_max_per_net(y_pins, net_id, gamma, n_nets)
+    lse_min_y = -_lse_max_per_net(-y_pins, net_id, gamma, n_nets)
+    hpwl = (lse_max_x - lse_min_x) + (lse_max_y - lse_min_y)
+    return hpwl.sum(dim=1)
 
 
 def tilos_density_loss(
@@ -604,37 +310,23 @@ def tilos_density_loss(
     cw: float,
     ch: float,
 ) -> torch.Tensor:
-    """
-    Faithful port of plc_client_os.PlacementCost.get_density_cost.
-
-    For each macro (hard + soft), accumulate (macro ∩ cell) area into a
-    ``[grid_row, grid_col]`` grid; per-cell density = occupied_area / grid_area.
-    Then return ``0.5 * mean(top-10% of cells)`` — *the exact same formula*
-    as TILOS, with the same 0.5 prefactor and the same top-K count
-    (``floor(num_cells * 0.1)``).
-
-    This is differentiable everywhere via min/max + sort.
-    """
     K, N, _ = pop.shape
     grid_w = cw / grid_col
     grid_h = ch / grid_row
     grid_area = grid_w * grid_h
     total_cells = grid_col * grid_row
     k_top = max(1, int(total_cells * 0.1))
-
-    # Cell edges
     col_idx = torch.arange(grid_col, device=pop.device, dtype=pop.dtype)
     row_idx = torch.arange(grid_row, device=pop.device, dtype=pop.dtype)
     col_l = col_idx * grid_w
     col_r = col_l + grid_w
     row_b = row_idx * grid_h
     row_t = row_b + grid_h
-
-    x = pop[..., 0]  # [K, N]
+    x = pop[..., 0]
     y = pop[..., 1]
-    hw = sizes[:, 0] / 2  # [N]
+    hw = sizes[:, 0] / 2
     hh = sizes[:, 1] / 2
-    macro_l = (x - hw.unsqueeze(0)).unsqueeze(-1)  # [K, N, 1]
+    macro_l = (x - hw.unsqueeze(0)).unsqueeze(-1)
     macro_r = (x + hw.unsqueeze(0)).unsqueeze(-1)
     macro_b_ = (y - hh.unsqueeze(0)).unsqueeze(-1)
     macro_t_ = (y + hh.unsqueeze(0)).unsqueeze(-1)
@@ -642,16 +334,14 @@ def tilos_density_loss(
     col_rb = col_r.view(1, 1, grid_col)
     row_bb = row_b.view(1, 1, grid_row)
     row_tb = row_t.view(1, 1, grid_row)
-
-    x_ov = (torch.min(macro_r, col_rb) - torch.max(macro_l, col_lb)).clamp(min=0.0)  # [K, N, Gx]
-    y_ov = (torch.min(macro_t_, row_tb) - torch.max(macro_b_, row_bb)).clamp(min=0.0)  # [K, N, Gy]
-    occupied = torch.einsum("knx,kny->kyx", x_ov, y_ov)  # [K, Gy, Gx]
-    density = occupied / grid_area  # [K, Gy, Gx]
+    x_ov = (torch.min(macro_r, col_rb) - torch.max(macro_l, col_lb)).clamp(min=0.0)
+    y_ov = (torch.min(macro_t_, row_tb) - torch.max(macro_b_, row_bb)).clamp(min=0.0)
+    occupied = torch.einsum("knx,kny->kyx", x_ov, y_ov)
+    density = occupied / grid_area
     cells = density.reshape(K, -1)
     sorted_d, _ = torch.sort(cells, dim=1, descending=True)
-    # TILOS: sum of top-K density / K (top-K count is floor(total*0.1))
     top_sum = sorted_d[:, :k_top].sum(dim=1)
-    return 0.5 * (top_sum / k_top)  # [K]  — matches get_density_cost()
+    return 0.5 * (top_sum / k_top)
 
 
 def tilos_wl_normalized(
@@ -667,13 +357,6 @@ def tilos_wl_normalized(
     cw: float,
     ch: float,
 ) -> torch.Tensor:
-    """
-    WAHPWL normalized exactly the way ``PlacementCost.get_cost()`` normalizes:
-        proxy_wl = total_HPWL / ((canvas_w + canvas_h) * net_cnt)
-
-    As γ → 0 the WAHPWL converges to true Manhattan HPWL, so this matches the
-    proxy's wirelength_cost in the limit.
-    """
     raw = wahpwl(pop, owner_idx, pin_off, net_id, n_nets, port_pos, n_hard, n_macros, gamma)
     return raw / ((cw + ch) * max(n_nets, 1))
 
@@ -696,23 +379,6 @@ def tilos_rudy_normalized(
     smooth_range: int = 2,
     k_frac: float = 0.05,
 ) -> torch.Tensor:
-    """
-    RUDY surrogate normalized as close to TILOS as a continuous approximation
-    allows.  Differs from the exact TILOS routing (which is discrete L/T
-    Steiner routing per net) but applies *the same per-axis normalisation*
-    and *the same 1-D smoothing kernel*.
-
-    Steps:
-      1. Compute per-net bbox via hard min/max scatter (subgradient via
-         torch.min/max).
-      2. H-demand per cell = (wl_x / bbox_area) × (cell ∩ bbox area).
-         V-demand similarly.
-      3. Normalise V by grid_v_routes = grid_w × v_routes_per_um and H by
-         grid_h_routes = grid_h × h_routes_per_um (same as TILOS).
-      4. Apply TILOS's 1-D smoothing: V along columns, H along rows, kernel
-         size = 2*smooth_range + 1.
-      5. Concatenate V+H lists and return top-5% mean (TILOS's abu).
-    """
     K = pop.shape[0]
     device = pop.device
     n_ports = port_pos.shape[0]
@@ -736,7 +402,6 @@ def tilos_rudy_normalized(
     y_min.scatter_reduce_(1, idx, y, reduce="amin", include_self=True)
     bbox_w = (x_max - x_min).clamp(min=1e-3)
     bbox_h = (y_max - y_min).clamp(min=1e-3)
-    bbox_area = bbox_w * bbox_h
 
     grid_w = cw / grid_col
     grid_h = ch / grid_row
@@ -750,204 +415,70 @@ def tilos_rudy_normalized(
     byb = y_min.unsqueeze(-1); byt = y_max.unsqueeze(-1)
     col_lb = col_l.view(1, 1, grid_col); col_rb = col_r.view(1, 1, grid_col)
     row_bb = row_b.view(1, 1, grid_row); row_tb = row_t.view(1, 1, grid_row)
-    x_ov = (torch.min(bxr, col_rb) - torch.max(bxl, col_lb)).clamp(min=0.0)  # [K, n_nets, Gx]
-    y_ov = (torch.min(byt, row_tb) - torch.max(byb, row_bb)).clamp(min=0.0)  # [K, n_nets, Gy]
-    # H demand: per-cell contribution = (wl_x / area) × x_ov × y_ov  = x_ov × y_ov / bbox_h
+    x_ov = (torch.min(bxr, col_rb) - torch.max(bxl, col_lb)).clamp(min=0.0)
+    y_ov = (torch.min(byt, row_tb) - torch.max(byb, row_bb)).clamp(min=0.0)
     inv_h = (1.0 / bbox_h).unsqueeze(-1)
     inv_w = (1.0 / bbox_w).unsqueeze(-1)
-    h_per_n_x = inv_h * x_ov  # [K, n_nets, Gx]
-    v_per_n_x = inv_w * x_ov  # [K, n_nets, Gx]  (RUDY V also occupies a vertical strip)
-    h_dem = torch.einsum("knx,kny->kyx", h_per_n_x, y_ov)  # [K, Gy, Gx]
+    h_per_n_x = inv_h * x_ov
+    v_per_n_x = inv_w * x_ov
+    h_dem = torch.einsum("knx,kny->kyx", h_per_n_x, y_ov)
     v_dem = torch.einsum("knx,kny->kyx", v_per_n_x, y_ov)
 
-    # Normalize per-axis by routing track capacity (matches TILOS):
     grid_v_routes = grid_w * v_routes_per_um
     grid_h_routes = grid_h * h_routes_per_um
     v_dem = v_dem / max(grid_v_routes, 1e-9)
     h_dem = h_dem / max(grid_h_routes, 1e-9)
 
-    # TILOS smoothing — 1-D box-filter along axis of routing, width 2*smooth_range+1
     if smooth_range > 0:
         ksz = 2 * smooth_range + 1
-        # V routing congestion smooths along columns (axis Gx); H smooths along rows (axis Gy).
-        # Use conv1d with appropriate reshaping.
-        v_dem_r = v_dem.unsqueeze(1)  # [K, 1, Gy, Gx]
+        v_dem_r = v_dem.unsqueeze(1)
         h_dem_r = h_dem.unsqueeze(1)
-        # Build a 1-D smoothing kernel that sums (TILOS divides BEFORE distribution then sums after)
-        # TILOS effective effect: each cell averages with its kernel-window neighbours and
-        # the same value gets *added* into adjacent cells (see __smooth_routing_cong) — net
-        # effect is a box filter normalised by (kernel-size at that location).
-        # We approximate with a simple box filter of length ksz.
         kx = torch.ones(1, 1, 1, ksz, device=device, dtype=pop.dtype) / ksz
         ky = torch.ones(1, 1, ksz, 1, device=device, dtype=pop.dtype) / ksz
         v_dem = torch.nn.functional.conv2d(v_dem_r, kx, padding=(0, smooth_range)).squeeze(1)
         h_dem = torch.nn.functional.conv2d(h_dem_r, ky, padding=(smooth_range, 0)).squeeze(1)
 
-    # TILOS concatenates V_cong + H_cong and takes top-5% mean
-    flat = torch.cat([v_dem.reshape(K, -1), h_dem.reshape(K, -1)], dim=1)  # [K, 2*Gy*Gx]
+    flat = torch.cat([v_dem.reshape(K, -1), h_dem.reshape(K, -1)], dim=1)
     total = flat.shape[1]
     k_top = max(1, int(total * k_frac))
     sorted_c, _ = torch.sort(flat, dim=1, descending=True)
-    return sorted_c[:, :k_top].mean(dim=1)  # [K]
+    return sorted_c[:, :k_top].mean(dim=1)
 
 
-def anchor_reg(
-    pop: torch.Tensor, anchor: torch.Tensor, mask: torch.Tensor
-) -> torch.Tensor:
-    """
-    Quadratic regulariser pulling movable macros toward the anchor positions.
-    ``mask`` is [K, N] — True where this individual should pay anchor cost.
-
-    The anchor regulariser is only applied to seed-0 (the anchor itself) +
-    optionally a couple of jittered seeds, so the rest of the population is
-    free to explore.
-    """
-    diff = (pop - anchor.unsqueeze(0)) * mask.unsqueeze(-1)
-    return diff.pow(2).sum(dim=(1, 2))
-
-
-def overlap_loss_hard(pos_hard: torch.Tensor, sizes_hard: torch.Tensor) -> torch.Tensor:
-    """Pairwise AABB overlap area summed over upper-triangle of hard macros."""
-    K, N, _ = pos_hard.shape
-    if N < 2:
-        return torch.zeros(K, device=pos_hard.device)
-    dx = (pos_hard[:, :, None, 0] - pos_hard[:, None, :, 0]).abs()
-    dy = (pos_hard[:, :, None, 1] - pos_hard[:, None, :, 1]).abs()
-    sx = (sizes_hard[:, 0:1] + sizes_hard[None, :, 0]) / 2  # [N, N]
-    sy = (sizes_hard[:, 1:2] + sizes_hard[None, :, 1]) / 2
-    ox = (sx.unsqueeze(0) - dx).clamp(min=0.0)
-    oy = (sy.unsqueeze(0) - dy).clamp(min=0.0)
-    overlap = ox * oy
-    diag = torch.eye(N, device=pos_hard.device, dtype=pos_hard.dtype).unsqueeze(0)
-    return (overlap * (1.0 - diag)).sum(dim=(1, 2)) / 2.0
+def _clip_soft_to_canvas(
+    pos_full: np.ndarray, benchmark: Benchmark, n_hard: int, cw: float, ch: float
+) -> np.ndarray:
+    all_sizes = benchmark.macro_sizes.numpy()
+    margin = 1e-3
+    for i in range(n_hard, benchmark.num_macros):
+        hw = float(all_sizes[i, 0]) / 2.0
+        hh = float(all_sizes[i, 1]) / 2.0
+        pos_full[i, 0] = max(hw + margin, min(cw - hw - margin, pos_full[i, 0]))
+        pos_full[i, 1] = max(hh + margin, min(ch - hh - margin, pos_full[i, 1]))
+    return pos_full
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Seed generation
+# Dynamic import of lk_placer modules (gp.py + placer.py)
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _force_directed_init(
-    edges: np.ndarray,
-    weights: np.ndarray,
-    n: int,
-    cw: float,
-    ch: float,
-    iters: int = 80,
-    seed: int = 0,
-) -> np.ndarray:
-    """Lightweight FD: spring + uniform repulsion, projected to canvas."""
-    rng = np.random.default_rng(seed)
-    pos = rng.random((n, 2)) * np.array([cw, ch])
-    if edges.shape[0] == 0:
-        return pos
-    for it in range(iters):
-        # Attraction (springs)
-        dx = pos[edges[:, 0], 0] - pos[edges[:, 1], 0]
-        dy = pos[edges[:, 0], 1] - pos[edges[:, 1], 1]
-        force = (weights * 0.05)[:, None] * np.stack([dx, dy], axis=1)
-        # Accumulate per-node
-        np.add.at(pos, edges[:, 0], -force)
-        np.add.at(pos, edges[:, 1], force)
-        # Mild centre pull to avoid drift
-        pos[:, 0] = pos[:, 0] + 0.02 * (cw / 2 - pos[:, 0])
-        pos[:, 1] = pos[:, 1] + 0.02 * (ch / 2 - pos[:, 1])
-    return pos
+def _lk_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "lk_placer"
 
 
-def _kmeans_clusters(coords: np.ndarray, k: int, seed: int = 0) -> np.ndarray:
-    """k-means cluster labels."""
-    if coords.shape[0] == 0 or k <= 1:
-        return np.zeros(coords.shape[0], dtype=np.int64)
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(coords.shape[0], size=min(k, coords.shape[0]), replace=False)
-    centres = coords[idx].copy()
-    labels = np.zeros(coords.shape[0], dtype=np.int64)
-    for _ in range(20):
-        d = ((coords[:, None, :] - centres[None, :, :]) ** 2).sum(-1)
-        labels = d.argmin(axis=1)
-        for c in range(centres.shape[0]):
-            sel = labels == c
-            if sel.any():
-                centres[c] = coords[sel].mean(axis=0)
-    return labels
+def _load_lk_gp():
+    spec = importlib.util.spec_from_file_location("_koral_lk_gp", str(_lk_dir() / "gp.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _build_population_seeds(
-    benchmark: Benchmark,
-    K: int,
-    edges: np.ndarray,
-    weights: np.ndarray,
-    sizes_np: np.ndarray,
-    movable_np: np.ndarray,
-    cw: float,
-    ch: float,
-    seed: int,
-) -> np.ndarray:
-    """
-    Construct K diverse seed placements over both hard *and* soft macros.
-
-    Returns an array of shape ``[K, n_macros, 2]``.  Soft macros for non-anchor
-    seeds are initially placed at the spectral / FD layout's mean position
-    plus a small jitter (so they have somewhere reasonable to start before the
-    joint gradient descent moves them).
-    """
-    rng = np.random.default_rng(seed)
-    n_hard = benchmark.num_hard_macros
-    n_macros = benchmark.num_macros
-    init_full = benchmark.macro_positions.numpy().astype(np.float64)  # [n_macros, 2]
-    init_hard = init_full[:n_hard].copy()
-    init_soft = init_full[n_hard:].copy()
-
-    pop = np.zeros((K, n_macros, 2), dtype=np.float32)
-
-    # Seed 0: legalized initial.plc
-    leg0 = _legalize(init_hard, sizes_np, movable_np, cw, ch, gap=0.005)
-    pop[0, :n_hard] = leg0
-    pop[0, n_hard:] = init_soft
-
-    if K == 1:
-        return pop
-
-    # Budget seed slots: roughly 1/8 spectral, 1/4 FD-random, rest jittered.
-    # Always clamp to fit in [1, K-1].
-    n_spec = max(1, K // 8) if K >= 8 else 0
-    n_fd = max(1, K // 4) if K >= 4 else 0
-    # If small K, fall back to just jittered anchor (cheapest, safest)
-    used = 1
-    # Seeds 1..n_spec: spectral with random rotations
-    for k in range(1, 1 + n_spec):
-        if k >= K:
-            break
-        sp = _spectral_layout(edges, weights, n_hard, cw, ch, sizes_np, seed=seed + k)
-        sp_leg = _legalize(sp, sizes_np, movable_np, cw, ch, gap=0.005)
-        pop[k, :n_hard] = sp_leg
-        pop[k, n_hard:, 0] = cw / 2 + rng.normal(0, cw * 0.2, n_macros - n_hard)
-        pop[k, n_hard:, 1] = ch / 2 + rng.normal(0, ch * 0.2, n_macros - n_hard)
-        used = k + 1
-    # FD-random
-    for k in range(used, used + n_fd):
-        if k >= K:
-            break
-        iters_ = rng.integers(40, 160)
-        fd = _force_directed_init(edges, weights, n_hard, cw, ch, iters=int(iters_), seed=seed + k * 7)
-        fd_leg = _legalize(fd, sizes_np, movable_np, cw, ch, gap=0.005)
-        pop[k, :n_hard] = fd_leg
-        pop[k, n_hard:, 0] = cw / 2 + rng.normal(0, cw * 0.25, n_macros - n_hard)
-        pop[k, n_hard:, 1] = ch / 2 + rng.normal(0, ch * 0.25, n_macros - n_hard)
-        used = k + 1
-    # Remaining: jittered initial.plc at varying scales
-    for k in range(used, K):
-        scale = 0.02 + 0.10 * rng.random()
-        jitter = rng.standard_normal((n_hard, 2)) * (min(cw, ch) * scale)
-        jitter[~movable_np] = 0.0
-        pos_h = init_hard + jitter
-        pos_h_leg = _legalize(pos_h, sizes_np, movable_np, cw, ch, gap=0.005)
-        pop[k, :n_hard] = pos_h_leg
-        soft_jit = rng.standard_normal((n_macros - n_hard, 2)) * (min(cw, ch) * scale * 0.5)
-        pop[k, n_hard:] = init_soft + soft_jit
-
-    return pop
+def _load_lk_placer():
+    spec = importlib.util.spec_from_file_location("_koral_lk_placer", str(_lk_dir() / "placer.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -956,91 +487,332 @@ def _build_population_seeds(
 
 
 class GraphGradPlacer:
-    """GPU-batched analytical placer with evolutionary resampling and dynamic macro halos."""
+    """Unified pipeline: focused-Poisson GP → koral soft-only Adam →
+    FastEvaluator-driven LK + regional + global LAHC."""
 
     def __init__(
         self,
         seed: int = 42,
-        pop_size: int = 96,
-        n_epochs: int = 8,
-        steps_per_epoch: int = 500,
-        grid_res: int = 32,
-        time_budget_s: float = 3000.0,
+        time_budget_s: float = 800.0,
         verbose: bool = True,
-        soft_steps: int = 4000, 
-        soft_lr: float = 0.015, 
-        n_restarts: int = 1,
+        # Phase α₁ (focused-Poisson GP)
+        gp_pop_size: int = 4,
+        gp_steps: int = 300,
+        gp_budget_s: float = 60.0,
+        # Phase α₂ (koral soft-only Adam)
+        run_soft_adam: bool = True,
+        soft_K: int = 24,
+        soft_steps: int = 2500,
+        soft_lr: float = 0.01,
+        soft_budget_s: float = 220.0,
+        # Phase 2 — α₂ true-cost subgradient
+        run_subgrad: bool = True,
+        subgrad_budget_s: float = 60.0,
+        # Phase 3 — LK k-opt
+        run_lk: bool = True,
+        lk_passes: int = 2,
+        lk_neighbors: int = 24,
+        lk_chain_depth: int = 4,
+        lk_budget_s: float = 150.0,
+        # Phase 4 — Hierarchical regional LAHC
+        run_regional: bool = True,
+        regional_grid_sizes: Tuple[int, ...] = (3, 5),
+        regional_min_macros: int = 30,
+        regional_budget_s: float = 130.0,
+        # Phase 5 — Global LAHC
+        run_lahc: bool = True,
+        lahc_list_len: int = 100,
+        lahc_min_budget_s: float = 60.0,
     ):
         self.seed = seed
-        self.pop_size = pop_size
-        self.n_epochs = n_epochs
-        self.steps_per_epoch = steps_per_epoch
-        self.grid_res = grid_res
         self.time_budget_s = time_budget_s
         self.verbose = verbose
+        self.gp_pop_size = gp_pop_size
+        self.gp_steps = gp_steps
+        self.gp_budget_s = gp_budget_s
+        self.run_soft_adam = run_soft_adam
+        self.soft_K = soft_K
         self.soft_steps = soft_steps
         self.soft_lr = soft_lr
-        self.n_restarts = n_restarts
+        self.soft_budget_s = soft_budget_s
+        self.run_subgrad = run_subgrad
+        self.subgrad_budget_s = subgrad_budget_s
+        self.run_lk = run_lk
+        self.lk_passes = lk_passes
+        self.lk_neighbors = lk_neighbors
+        self.lk_chain_depth = lk_chain_depth
+        self.lk_budget_s = lk_budget_s
+        self.run_regional = run_regional
+        self.regional_grid_sizes = tuple(regional_grid_sizes)
+        self.regional_min_macros = regional_min_macros
+        self.regional_budget_s = regional_budget_s
+        self.run_lahc = run_lahc
+        self.lahc_list_len = lahc_list_len
+        self.lahc_min_budget_s = lahc_min_budget_s
 
     def _log(self, msg: str):
         if self.verbose:
             print(f"[graph_grad] {msg}", flush=True)
 
-    def _true_cost(self, plc, full: torch.Tensor, benchmark: Benchmark) -> float:
-        from macro_place.objective import compute_proxy_cost
-        try:
-            return float(compute_proxy_cost(full, benchmark, plc)["proxy_cost"])
-        except Exception:
-            return float("inf")
-
     def place(self, benchmark: Benchmark) -> torch.Tensor:
-        # Step 1: Run the Evolutionary Phased Placer
-        best_full = self._place_evolutionary(benchmark)
-        
-        # Step 2: Run the Greedy Orientation Optimizer for free wirelength reduction
-        best_full, orientations = self._optimize_orientations(benchmark, best_full)
-        
-        torch.save(orientations, "orientations.pt")
-        self._log("Saved orientations to orientations.pt")
-        
-        return best_full
-
-    def _place_evolutionary(self, benchmark: Benchmark) -> torch.Tensor:
-        """
-        Hybrid optimization: Dynamic Halos + Evolutionary Resampling + Drift.
-        """
-        best_across = None
-        best_across_cost = float("inf")
-        
-        for r in range(self.n_restarts):
-            run_seed = self.seed + 1000 * r
-            full, cost = self._evolutionary_single_run(benchmark, run_seed)
-            if cost < best_across_cost:
-                best_across_cost = cost
-                best_across = full
-            if self.verbose and self.n_restarts > 1:
-                self._log(f"restart {r+1}/{self.n_restarts}: proxy={cost:.4f}  best={best_across_cost:.4f}")
-                
-        return best_across
-
-    def _evolutionary_single_run(self, benchmark: Benchmark, run_seed: int):
         from macro_place.objective import compute_proxy_cost
 
-        t_start = time.time()
-        torch.manual_seed(run_seed)
-        np.random.seed(run_seed)
-        random.seed(run_seed)
-        device = _device()
+        t0 = time.time()
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
 
         n_hard = benchmark.num_hard_macros
         n_macros = benchmark.num_macros
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
+        sizes_np_hard = benchmark.macro_sizes[:n_hard].cpu().numpy().astype(np.float64)
+        movable_hard = benchmark.get_movable_mask()[:n_hard].cpu().numpy().astype(bool)
+
+        plc = _load_plc(benchmark.name)
+        if plc is None:
+            self._log(f"WARNING: plc=None for {benchmark.name}; oracle phases skipped")
+
+        # Preserve original positions so we can rebuild the anchor at any point.
+        orig_positions = benchmark.macro_positions.cpu().numpy().astype(np.float64).copy()
+
+        # Per-benchmark K adaptation
+        if n_macros < 100:
+            soft_K = 16
+        else:
+            soft_K = self.soft_K
+        soft_steps = self.soft_steps
+        if n_hard > 500:
+            soft_steps = min(soft_steps, 2000)
+
+        # Phase 0: legalize initial.plc → anchor floor
+        init_hard = orig_positions[:n_hard].copy()
+        anchor_hard = _legalize(init_hard, sizes_np_hard, movable_hard, cw, ch, gap=0.005)
+        anchor_full = orig_positions.copy()
+        anchor_full[:n_hard] = anchor_hard
+        anchor_full = _clip_soft_to_canvas(anchor_full, benchmark, n_hard, cw, ch)
+
+        def _oracle(pos_np: np.ndarray) -> Tuple[float, int]:
+            if plc is None:
+                return float("inf"), 0
+            try:
+                c = compute_proxy_cost(torch.from_numpy(pos_np).float(), benchmark, plc)
+                return float(c["proxy_cost"]), int(c["overlap_count"])
+            except Exception:
+                return float("inf"), -1
+
+        anchor_cost, anchor_ov = _oracle(anchor_full)
+        self._log(
+            f"setup: name={benchmark.name} n_hard={n_hard} n_macros={n_macros} "
+            f"budget={self.time_budget_s:.0f}s  anchor_proxy={anchor_cost:.4f} overlaps={anchor_ov}"
+        )
+
+        best_pos = anchor_full.copy() if anchor_ov == 0 else None
+        best_true = anchor_cost if anchor_ov == 0 else float("inf")
+
+        def _commit(pos_np: np.ndarray, label: str):
+            nonlocal best_pos, best_true
+            c, ov = _oracle(pos_np)
+            self._log(f"  [{label}] oracle proxy={c:.4f} overlaps={ov}")
+            if ov == 0 and c < best_true:
+                best_true = c
+                best_pos = pos_np.copy()
+                self._log(f"  [{label}] new best={best_true:.4f}")
+                return True
+            return False
+
+        # ── Phase α₁: focused-Poisson electrostatic GP ──
+        # Start GP from anchor (the legalized initial.plc).
+        benchmark.macro_positions = torch.from_numpy(anchor_full).float()
+        if time.time() - t0 < self.time_budget_s * 0.95:
+            try:
+                gp_mod = _load_lk_gp()
+                budget = min(self.gp_budget_s, self.time_budget_s - (time.time() - t0) - 30.0)
+                self._log(
+                    f"Phase α₁: focused-Poisson GP (pop={self.gp_pop_size}, "
+                    f"steps={self.gp_steps}, budget={budget:.0f}s)"
+                )
+                gp_positions = gp_mod.run_global_placement(
+                    benchmark, plc,
+                    pop_size=self.gp_pop_size,
+                    n_steps=self.gp_steps,
+                    time_budget_s=max(10.0, budget),
+                    seed=self.seed,
+                    verbose=self.verbose,
+                )
+                # Legalize hard macros after GP (it can move them slightly into overlap)
+                gp_hard = gp_positions[:n_hard].astype(np.float64)
+                gp_hard_leg = _legalize(gp_hard, sizes_np_hard, movable_hard, cw, ch, gap=0.005)
+                gp_full = gp_positions.astype(np.float64).copy()
+                gp_full[:n_hard] = gp_hard_leg
+                gp_full = _clip_soft_to_canvas(gp_full, benchmark, n_hard, cw, ch)
+                _commit(gp_full, "α₁ gp")
+                benchmark.macro_positions = torch.from_numpy(gp_full).float()
+            except Exception as e:
+                self._log(f"Phase α₁: skipped due to exception: {e}")
+
+        # ── Phase α₂: koral soft-only Adam (K=24, hard locked) ──
+        if self.run_soft_adam and time.time() - t0 < self.time_budget_s * 0.85:
+            budget = min(self.soft_budget_s, self.time_budget_s - (time.time() - t0) - 60.0)
+            self._log(
+                f"Phase α₂: soft-only Adam (K={soft_K}, steps={soft_steps}, "
+                f"budget={budget:.0f}s)"
+            )
+            try:
+                pos_full, surr_cost = self._run_soft_adam(
+                    benchmark, K=soft_K, n_steps=soft_steps,
+                    budget_s=budget, plc=plc,
+                )
+                if pos_full is not None:
+                    _commit(pos_full, "α₂ soft-Adam")
+            except Exception as e:
+                self._log(f"Phase α₂: exception: {e}")
+
+        # ── Phase 1: FastEvaluator on best so far ──
+        if best_pos is None:
+            # Nothing valid yet — fall back to anchor (it's always legal but might
+            # have overlap_count > 0 only if the input plc was broken)
+            best_pos = anchor_full.copy()
+            best_true = anchor_cost
+        benchmark.macro_positions = torch.from_numpy(best_pos).float()
+
+        try:
+            lk_mod = _load_lk_placer()
+        except Exception as e:
+            self._log(f"Could not import lk_placer: {e}; returning best so far ({best_true:.4f})")
+            return torch.from_numpy(best_pos).float()
+
+        self._log("Phase 1: building FastEvaluator")
+        try:
+            ev = lk_mod.FastEvaluator(benchmark, plc)
+        except Exception as e:
+            self._log(f"FastEvaluator build failed: {e}; returning best so far ({best_true:.4f})")
+            return torch.from_numpy(best_pos).float()
+
+        c_fast = ev.proxy_cost()
+        self._log(
+            f"  fast baseline: proxy={c_fast['proxy_cost']:.4f} "
+            f"wl={c_fast['wirelength_cost']:.4f} d={c_fast['density_cost']:.4f} "
+            f"c={c_fast['congestion_cost']:.4f}"
+        )
+        # Drift check: fast vs oracle should agree to ~1e-3.
+        drift = abs(c_fast["proxy_cost"] - best_true)
+        if drift > 5e-3:
+            self._log(f"  WARNING: FastEvaluator/oracle drift={drift:.4f}; downstream phases may misrank")
+
+        # ── Phase 2: true-cost numerical subgradient ──
+        if self.run_subgrad and time.time() - t0 < self.time_budget_s - self.lahc_min_budget_s:
+            budget = min(self.subgrad_budget_s, self.time_budget_s - (time.time() - t0) - self.lahc_min_budget_s)
+            self._log(f"Phase 2: true-cost subgradient (budget={budget:.0f}s)")
+            try:
+                lk_mod.true_cost_subgradient(ev, time_budget_s=budget, seed=self.seed, verbose=self.verbose)
+                _commit(ev.positions.copy(), "subgrad")
+            except Exception as e:
+                self._log(f"Phase 2: exception: {e}")
+            if best_pos is not None:
+                ev.restore(best_pos)
+
+        # ── Phase 3: LK k-opt ──
+        if self.run_lk and time.time() - t0 < self.time_budget_s - self.lahc_min_budget_s:
+            lk_deadline = time.time() + min(self.lk_budget_s,
+                                            self.time_budget_s - (time.time() - t0) - self.lahc_min_budget_s)
+            for p in range(self.lk_passes):
+                if time.time() >= lk_deadline:
+                    self._log(f"Phase 3 pass {p}: LK budget exhausted")
+                    break
+                self._log(f"Phase 3 pass {p}: LK k-opt")
+                try:
+                    order = lk_mod._macro_priority(ev)
+                    cur_cost, n_acc = lk_mod.lk_swap_pass(
+                        ev, order,
+                        chain_depth=self.lk_chain_depth,
+                        n_neighbors_per_macro=self.lk_neighbors,
+                        log_every=max(1, len(order) // 6) if self.verbose else None,
+                    )
+                    self._log(f"  pass {p}: fast={cur_cost:.4f} accepted={n_acc}")
+                    _commit(ev.positions.copy(), f"LK p{p}")
+                except Exception as e:
+                    self._log(f"Phase 3 pass {p}: exception: {e}")
+                    break
+            if best_pos is not None:
+                ev.restore(best_pos)
+
+        # ── Phase 4: Hierarchical regional LAHC ──
+        if (
+            self.run_regional
+            and n_hard >= self.regional_min_macros
+            and time.time() - t0 < self.time_budget_s - self.lahc_min_budget_s
+        ):
+            budget = min(self.regional_budget_s,
+                         self.time_budget_s - (time.time() - t0) - self.lahc_min_budget_s)
+            self._log(
+                f"Phase 4: regional LAHC grids={self.regional_grid_sizes} budget={budget:.0f}s"
+            )
+            try:
+                lk_mod.regional_polish(
+                    ev,
+                    region_grids=self.regional_grid_sizes,
+                    time_budget_s=budget,
+                    seed=self.seed,
+                    verbose=self.verbose,
+                )
+                _commit(ev.positions.copy(), "regional")
+            except Exception as e:
+                self._log(f"Phase 4: exception: {e}")
+            if best_pos is not None:
+                ev.restore(best_pos)
+
+        # ── Phase 5: Global LAHC polish ──
+        if self.run_lahc:
+            remaining = max(self.lahc_min_budget_s, self.time_budget_s - (time.time() - t0))
+            self._log(f"Phase 5: global LAHC polish (budget={remaining:.0f}s)")
+            try:
+                lk_mod.lahc_polish(
+                    ev,
+                    list_len=self.lahc_list_len,
+                    time_budget_s=remaining,
+                    seed=self.seed,
+                    verbose=self.verbose,
+                )
+                _commit(ev.positions.copy(), "LAHC")
+            except Exception as e:
+                self._log(f"Phase 5: exception: {e}")
+
+        # ── Final safety net: never regress below the anchor floor ──
+        if anchor_ov == 0 and anchor_cost < best_true:
+            self._log(f"safety net: returning anchor ({anchor_cost:.4f}) < best ({best_true:.4f})")
+            best_pos = anchor_full.copy()
+            best_true = anchor_cost
+
+        self._log(f"DONE  best_proxy={best_true:.4f}  time={time.time()-t0:.1f}s")
+        return torch.from_numpy(best_pos).float()
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase α₂ — koral soft-only Adam (the proven sub-anchor winner)
+    # ────────────────────────────────────────────────────────────────────
+
+    def _run_soft_adam(
+        self,
+        benchmark: Benchmark,
+        K: int,
+        n_steps: int,
+        budget_s: float,
+        plc,
+    ) -> Tuple[Optional[np.ndarray], float]:
+        """Run K-batched Adam on the TILOS-faithful surrogate with hard macros
+        locked at their current positions in `benchmark.macro_positions`.
+
+        Returns (best_full_positions_or_None, best_surrogate_cost).
+        """
+        from macro_place.objective import compute_proxy_cost
+
+        t_start = time.time()
+        device = _device()
+        n_hard = benchmark.num_hard_macros
+        n_macros = benchmark.num_macros
+        cw = float(benchmark.canvas_width)
+        ch = float(benchmark.canvas_height)
         sizes_all = benchmark.macro_sizes.to(device).float()
-        sizes_np = benchmark.macro_sizes[:n_hard].numpy().astype(np.float64)
-        movable_np = benchmark.get_movable_mask()[:n_hard].numpy()
-        movable_t = torch.from_numpy(movable_np).to(device)
-        
         owner_idx, pin_off, net_id, n_nets = _build_pin_tensors(benchmark, device)
         port_pos = benchmark.port_positions.to(device).float()
         half_w_t = sizes_all[:, 0] / 2
@@ -1050,201 +822,86 @@ class GraphGradPlacer:
         h_per_um = float(benchmark.hroutes_per_micron)
         v_per_um = float(benchmark.vroutes_per_micron)
 
-        self._log(f"Evolutionary Run Setup: n_hard={n_hard} n_soft={n_macros - n_hard}")
+        hard_lock_t = benchmark.macro_positions[:n_hard].to(device).float()
+        soft_anchor = benchmark.macro_positions[n_hard:].to(device).float()
 
-        K = self.pop_size
-
-        # Build pair graph and generate K diverse starting seeds
-        edges, weights = _build_pair_graph(benchmark)
-        seeds = _build_population_seeds(
-            benchmark, self.pop_size, edges, weights, sizes_np, movable_np, cw, ch, seed=run_seed
-        )
-        
-        pop = torch.tensor(seeds, device=device, dtype=torch.float32)
+        pop = torch.zeros(K, n_macros, 2, device=device, dtype=torch.float32)
+        pop[:, :n_hard] = hard_lock_t
+        pop[:, n_hard:] = soft_anchor + torch.randn(K, n_macros - n_hard, 2, device=device) * 0.1
         pop.requires_grad_(True)
-        
-        # Keep track of the locked/anchor state for Phase 4 polish
-        hard_legal_t = pop[0, :n_hard].clone().detach() # Seed 0 is your initial.plc anchor
-        
         opt = torch.optim.Adam([pop], lr=self.soft_lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.soft_steps)
 
-        n_steps = self.soft_steps
-        phase_1_end = int(n_steps * 0.3)
-        phase_2_end = int(n_steps * 0.7)
-        
-        step_iterator = tqdm(range(n_steps), desc=f"Adam Steps", disable=not self.verbose)
-
-        for step in step_iterator:
+        log_every = max(n_steps // 6, 1)
+        for step in range(n_steps):
+            if time.time() - t_start > budget_s:
+                if self.verbose:
+                    self._log(f"  soft-Adam: budget reached at step {step}")
+                break
             opt.zero_grad()
             progress = step / max(n_steps, 1)
-            gamma = 1.0 * (0.05 ** progress) 
-            
-            # --- STRATEGY 1: DYNAMIC HALOS (PADDING) ---
-            # Inflate hard macros by up to 30% early on to reserve routing channels
-            pad_pct = 0.30 * max(0.0, 1.0 - (step / phase_2_end))
-            sizes_padded = sizes_all.clone()
-            sizes_padded[:n_hard, 0] *= (1.0 + pad_pct)
-            sizes_padded[:n_hard, 1] *= (1.0 + pad_pct)
-            
-            # Calculate surrogates. Note: Density uses padded sizes.
-            wl_n = tilos_wl_normalized(pop, owner_idx, pin_off, net_id, n_nets, port_pos, n_hard, n_macros, gamma, cw, ch)
-            dens = tilos_density_loss(pop, sizes_padded, grid_col, grid_row, cw, ch)
-            cong = tilos_rudy_normalized(pop, owner_idx, pin_off, net_id, n_nets, port_pos, n_hard, n_macros, grid_col, grid_row, cw, ch, h_per_um, v_per_um, smooth_range=2, k_frac=0.05)
-            
-            # Adaptive Weights: Heavily penalize congestion during the drift phase
-            w_cong = 1.5 if (phase_1_end <= step < phase_2_end) else 0.5
-            w_dens = 1.0 if (phase_1_end <= step < phase_2_end) else 0.5
-            
-            proxy_surr = wl_n + w_dens * dens + w_cong * cong
+            gamma = 1.0 * (0.05 ** progress)
+            wl_n = tilos_wl_normalized(
+                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                n_hard, n_macros, gamma, cw, ch,
+            )
+            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
+            cong = tilos_rudy_normalized(
+                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                n_hard, n_macros, grid_col, grid_row, cw, ch,
+                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+            )
+            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong
             loss = proxy_surr.sum()
             loss.backward()
-
             with torch.no_grad():
-                if step < phase_1_end:
-                    pop.grad[:, :n_hard].zero_()
-                elif step < phase_2_end:
-                    # Allow hard macros to drift away from the halo pressure
-                    pop.grad[:, :n_hard] *= 0.1
-                    pop.grad[:, :n_hard][:, ~movable_t] = 0.0
-                else:
-                    pop.grad[:, :n_hard].zero_()
-
+                pop.grad[:, :n_hard].zero_()
             opt.step()
-            scheduler.step()
-
-            # --- STRATEGY 2: EVOLUTIONARY RESAMPLING ---
-            # Every 500 steps during the fluid phases, kill the bottom 50%
-            if step > 0 and step % 500 == 0 and step < phase_2_end:
-                with torch.no_grad():
-                    current_fitness = proxy_surr.detach()
-                    sorted_idx = torch.argsort(current_fitness)
-                    
-                    top_idx = sorted_idx[: K // 10]     # Top 10%
-                    bottom_idx = sorted_idx[K // 2 :]   # Bottom 50%
-                    
-                    for i, b_idx in enumerate(bottom_idx):
-                        # Clone a random top performer
-                        t_idx = top_idx[i % len(top_idx)]
-                        pop.data[b_idx] = pop.data[t_idx].clone()
-                        
-                        # Mutate: Inject targeted noise to the hard macros to explore adjacent basins
-                        jitter = torch.randn(n_hard, 2, device=device) * (min(cw, ch) * 0.03)
-                        jitter[~movable_t] = 0.0 
-                        pop.data[b_idx, :n_hard] += jitter
-                        
-                self._log(f"Step {step}: Resampled bottom {len(bottom_idx)} seeds from top {len(top_idx)} parents.")
-
-            # --- Phase 3 Transition: Re-Legalize ---
-            if step == phase_2_end:
-                self._log("Initiating mid-flight legalization of drifted hard macros...")
-                with torch.no_grad():
-                    pop_cpu = pop.detach().cpu().numpy()
-                    for k in range(K):
-                        hard_k = pop_cpu[k, :n_hard].astype(np.float64)
-                        # Re-legalize using REAL sizes (not padded), ensuring a valid state
-                        hard_leg = _legalize(hard_k, sizes_np, movable_np, cw, ch, gap=0.01)
-                        pop_cpu[k, :n_hard] = hard_leg.astype(np.float32)
-                    pop.data = torch.tensor(pop_cpu, device=device, dtype=torch.float32)
-                    hard_legal_t = pop[:, :n_hard].clone()
-
-            # Canvas clamps
             with torch.no_grad():
-                if step < phase_2_end:
-                    pop[:, :n_hard, 0].clamp_(min=half_w_t[:n_hard], max=cw - half_w_t[:n_hard])
-                    pop[:, :n_hard, 1].clamp_(min=half_h_t[:n_hard], max=ch - half_h_t[:n_hard])
-                else:
-                    pop[:, :n_hard] = hard_legal_t # Lock down for polish phase
-                    
                 pop[:, n_hard:, 0].clamp_(min=half_w_t[n_hard:], max=cw - half_w_t[n_hard:])
                 pop[:, n_hard:, 1].clamp_(min=half_h_t[n_hard:], max=ch - half_h_t[n_hard:])
+                pop[:, :n_hard] = hard_lock_t
+            if self.verbose and step % log_every == 0:
+                self._log(
+                    f"  soft-Adam step {step}: wl={wl_n.mean().item():.4f} "
+                    f"d={dens.mean().item():.4f} c={cong.mean().item():.4f} "
+                    f"surr={proxy_surr.mean().item():.4f}"
+                )
 
-            if self.verbose and step % 50 == 0:
-                step_iterator.set_postfix({
-                    "wl": f"{wl_n.mean().item():.3f}", 
-                    "dens": f"{dens.mean().item():.3f}", 
-                    "cong": f"{cong.mean().item():.3f}"
-                })
-               
-        # Final Evaluation
+        # Rank candidates by surrogate; oracle-evaluate top-8.
         with torch.no_grad():
+            wl_n = tilos_wl_normalized(
+                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                n_hard, n_macros, 0.05, cw, ch,
+            )
+            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
+            cong = tilos_rudy_normalized(
+                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+                n_hard, n_macros, grid_col, grid_row, cw, ch,
+                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+            )
             surr = wl_n + 0.5 * dens + 0.5 * cong
-            
-        k_eval = min(K, max(12, K // 2)) # Evaluate slightly more candidates
+        k_eval = min(K, 8)
         top_idx = torch.topk(-surr, k=k_eval).indices.tolist()
 
-        plc = _load_plc(benchmark.name)
-        best_full, best_cost = None, float("inf")
-        
-        for k in top_idx:
-            pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
-            pos_full = self._clip_soft_to_canvas(pos_full, benchmark, n_hard, cw, ch)
-            full_t = torch.from_numpy(pos_full).float()
-            if plc is None: continue
-            c = compute_proxy_cost(full_t, benchmark, plc)
-            if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
-                best_cost = c["proxy_cost"]
-                best_full = full_t
-
-        if best_full is None:
-            best_full = torch.from_numpy(self._clip_soft_to_canvas(pop[0].detach().cpu().numpy().astype(np.float64), benchmark, n_hard, cw, ch)).float()
-
-        self._log(f"Evolutionary Run Complete: Best true_proxy={best_cost:.4f}")
-        return best_full, best_cost
-
-    def _optimize_orientations(self, benchmark: Benchmark, best_full: torch.Tensor):
-        """
-        Greedy orientation search for hard macros (N, FN, FS, S).
-        """
-        self._log("Starting greedy orientation optimization...")
-        from macro_place.objective import compute_proxy_cost
-        
-        device = _device()
-        n_hard = benchmark.num_hard_macros
-        plc = _load_plc(benchmark.name)
-        
-        current_orientations = torch.zeros(n_hard, dtype=torch.int32, device=device)
-        if plc is None:
-            return best_full, current_orientations
-
-        best_cost = compute_proxy_cost(best_full, benchmark, plc)["proxy_cost"]
-        improved = True
-        passes = 0
-        
-        while improved and passes < 3:
-            improved = False
-            passes += 1
-            for macro_idx in range(n_hard):
-                if not benchmark.get_movable_mask()[macro_idx]:
+        best_full = None
+        best_cost = float("inf")
+        if plc is not None:
+            for k in top_idx:
+                pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
+                pos_full = _clip_soft_to_canvas(pos_full, benchmark, n_hard, cw, ch)
+                try:
+                    full_t = torch.from_numpy(pos_full).float()
+                    c = compute_proxy_cost(full_t, benchmark, plc)
+                    if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
+                        best_cost = float(c["proxy_cost"])
+                        best_full = pos_full
+                except Exception:
                     continue
-                    
-                local_best_ori = current_orientations[macro_idx].item()
-                local_best_cost = best_cost
-                
-                for test_ori in [0, 1, 2, 3]:
-                    if test_ori == local_best_ori: continue
-                    plc.set_macro_orientation(macro_idx, test_ori)
-                    test_cost = compute_proxy_cost(best_full, benchmark, plc)["proxy_cost"]
-                    
-                    if test_cost < local_best_cost:
-                        local_best_cost = test_cost
-                        local_best_ori = test_ori
-                        improved = True
-                
-                plc.set_macro_orientation(macro_idx, local_best_ori)
-                current_orientations[macro_idx] = local_best_ori
-                best_cost = local_best_cost
-                
-        self._log(f"Orientation optimization finished. Final true_proxy={best_cost:.4f}")
-        return best_full, current_orientations
+        else:
+            # No oracle: return the surrogate-best candidate
+            k = int(torch.argmin(surr).item())
+            best_full = pop[k].detach().cpu().numpy().astype(np.float64)
+            best_full = _clip_soft_to_canvas(best_full, benchmark, n_hard, cw, ch)
+            best_cost = float(surr[k].item())
 
-    @staticmethod
-    def _clip_soft_to_canvas(pos_full: np.ndarray, benchmark: Benchmark, n_hard: int, cw: float, ch: float) -> np.ndarray:
-        all_sizes = benchmark.macro_sizes.numpy()
-        margin = 1e-3
-        for i in range(n_hard, benchmark.num_macros):
-            hw = float(all_sizes[i, 0]) / 2.0
-            hh = float(all_sizes[i, 1]) / 2.0
-            pos_full[i, 0] = max(hw + margin, min(cw - hw - margin, pos_full[i, 0]))
-            pos_full[i, 1] = max(hh + margin, min(ch - hh - margin, pos_full[i, 1]))
-        return pos_full
+        return best_full, best_cost
