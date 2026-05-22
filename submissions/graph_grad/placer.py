@@ -1203,22 +1203,22 @@ class LKPlacer:
         time_budget_s: float = 3000.0,
         # Phase α₁ (electrostatic GP)
         run_gp: bool = True,
-        gp_pop_size: int = 4,
-        gp_steps: int = 500,
-        gp_budget_s: float = 90.0,
+        gp_pop_size: int = 16,
+        gp_steps: int = 20000,
+        gp_budget_s: float = 300.0,
         # Phase α₂ (true-cost subgradient)
         run_alpha2: bool = True,
-        alpha2_budget_s: float = 60.0,
+        alpha2_budget_s: float = 150.0,
         # Phase 2 LK
         lk_passes: int = 3,
-        lk_neighbors: int = 24,
-        lk_chain_depth: int = 4,
+        lk_neighbors: int = 36,
+        lk_chain_depth: int = 6,
         # Phase 2.5 direct congestion attack
         run_cong_attack: bool = False,  # disabled: greedy moves trap LAHC in tighter basin
         cong_attack_passes: int = 3,
         cong_attack_budget_s: float = 60.0,
         # Phase 3 LAHC
-        lahc_list_len: int = 100,
+        lahc_list_len: int = 150,
         verbose: bool = True,
     ):
         self.seed = seed
