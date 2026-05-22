@@ -950,6 +950,54 @@ def _build_population_seeds(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Compiled inner-loop surrogate (torch.compile ≈ 1.5–3× on the Adam step)
+#
+# gamma is passed as a 0-d tensor (not a Python float) so dynamo doesn't
+# specialize on its value and recompile every step. Per-benchmark recompile
+# (different N, n_nets, grid sizes) is fine — pays ~12-30s of compile time
+# once, saves ~100ms × 5000 = ~500s afterwards.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _proxy_surrogate(
+    pop: torch.Tensor,
+    sizes_all: torch.Tensor,
+    owner_idx: torch.Tensor,
+    pin_off: torch.Tensor,
+    net_id: torch.Tensor,
+    n_nets: int,
+    port_pos: torch.Tensor,
+    n_hard: int,
+    n_macros: int,
+    grid_col: int,
+    grid_row: int,
+    cw: float,
+    ch: float,
+    h_per_um: float,
+    v_per_um: float,
+    gamma: torch.Tensor,
+):
+    wl = tilos_wl_normalized(
+        pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+        n_hard, n_macros, gamma, cw, ch,
+    )
+    dn = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
+    cg = tilos_rudy_normalized(
+        pop, owner_idx, pin_off, net_id, n_nets, port_pos,
+        n_hard, n_macros, grid_col, grid_row, cw, ch,
+        h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
+    )
+    proxy_surr = wl + 0.5 * dn + 0.5 * cg
+    return proxy_surr.sum(), wl, dn, cg, proxy_surr
+
+
+try:
+    _proxy_surrogate_compiled = torch.compile(_proxy_surrogate, dynamic=False)
+except Exception:  # torch.compile unavailable / disabled — fall back to eager
+    _proxy_surrogate_compiled = _proxy_surrogate
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Main placer
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -982,14 +1030,9 @@ class GraphGradPlacer:
         # When this is hit, koral aborts whatever stage it's in and hands off
         # to LAHC. Default 10 min ensures LAHC always gets ≥45 min.
         koral_max_budget_s: float = 600.0,
-        # Top-K oracle scoring early-exit: stop scoring candidates once we've
-        # had `koral_scoring_plateau_threshold` consecutive scores without
-        # improvement. Floor of `koral_scoring_min_candidates` always scored.
-        # Crucial on large designs (ibm17-18) where each oracle call costs 15s+.
-        koral_scoring_plateau_threshold: int = 4,
-        koral_scoring_min_candidates: int = 8,
         # Cap on the top-K candidates scored against the oracle in soft-only
-        # mode. Lower = faster (each oracle call is 5-15s on big designs).
+        # mode. Scoring also stops when the koral wall-clock deadline hits.
+        # Lower = faster (each oracle call is 5-15s on big designs).
         koral_k_eval: int = 24,
     ):
         self.seed = seed
@@ -1009,8 +1052,6 @@ class GraphGradPlacer:
         self.lahc_min_budget_s = lahc_min_budget_s
         self.lahc_log_interval_s = lahc_log_interval_s
         self.koral_max_budget_s = koral_max_budget_s
-        self.koral_scoring_plateau_threshold = koral_scoring_plateau_threshold
-        self.koral_scoring_min_candidates = koral_scoring_min_candidates
         self.koral_k_eval = koral_k_eval
         # Filled in by place(); used by inner loops as a hard wall-clock deadline.
         self._koral_deadline: Optional[float] = None
@@ -1250,6 +1291,9 @@ class GraphGradPlacer:
             self._koral_deadline - 0.10 * self.koral_max_budget_s
             if self._koral_deadline is not None else None
         )
+        # Pre-allocate gamma as a 0-d tensor so torch.compile doesn't recompile
+        # the graph each step on a changing Python float.
+        gamma_t = torch.tensor(1.0, device=device, dtype=torch.float32)
         for step in range(n_steps):
             # Hard wall-clock check: bail early if the koral budget is almost up.
             if adam_deadline is not None and time.time() >= adam_deadline:
@@ -1260,19 +1304,12 @@ class GraphGradPlacer:
                 break
             opt.zero_grad()
             progress = step / max(n_steps, 1)
-            gamma = 1.0 * (0.05 ** progress)  # WAHPWL smoothing → sharp Manhattan HPWL
-            wl_n = tilos_wl_normalized(
-                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, gamma, cw, ch,
+            gamma_t.fill_(1.0 * (0.05 ** progress))  # WAHPWL smoothing
+            loss, wl_n, dens, cong, proxy_surr = _proxy_surrogate_compiled(
+                pop, sizes_all, owner_idx, pin_off, net_id, n_nets,
+                port_pos, n_hard, n_macros, grid_col, grid_row, cw, ch,
+                h_per_um, v_per_um, gamma_t,
             )
-            dens = tilos_density_loss(pop, sizes_all, grid_col, grid_row, cw, ch)
-            cong = tilos_rudy_normalized(
-                pop, owner_idx, pin_off, net_id, n_nets, port_pos,
-                n_hard, n_macros, grid_col, grid_row, cw, ch,
-                h_per_um, v_per_um, smooth_range=2, k_frac=0.05,
-            )
-            proxy_surr = wl_n + 0.5 * dens + 0.5 * cong  # mirrors compute_proxy_cost
-            loss = proxy_surr.sum()
             loss.backward()
             with torch.no_grad():
                 pop.grad[:, :n_hard].zero_()  # LOCK hard macros
@@ -1307,16 +1344,12 @@ class GraphGradPlacer:
         # Cache plc once — each _load_plc reparses the netlist (~seconds)
         plc = _load_plc(benchmark.name)
         best_full, best_cost = None, float("inf")
-        plateau_th = self.koral_scoring_plateau_threshold
-        min_scored = max(self.koral_scoring_min_candidates, plateau_th)
         self._log(
             f"top-K oracle scoring: up to {len(top_idx)} candidates  "
-            f"(plateau early-exit after {plateau_th} non-improving scores, "
-            f"min {min_scored} always scored)"
+            f"(stops on koral deadline)"
         )
         _score_t0 = time.time()
         _score_last_log = _score_t0
-        no_improve = 0
         scored_total = 0
         for _i, k in enumerate(top_idx):
             pos_full = pop[k].detach().cpu().numpy().astype(np.float64)
@@ -1326,29 +1359,17 @@ class GraphGradPlacer:
                 continue
             c = compute_proxy_cost(full_t, benchmark, plc)
             scored_total = _i + 1
-            improved = c["overlap_count"] == 0 and c["proxy_cost"] < best_cost
-            if improved:
+            if c["overlap_count"] == 0 and c["proxy_cost"] < best_cost:
                 best_cost = c["proxy_cost"]
                 best_full = full_t
-                no_improve = 0
-            else:
-                no_improve += 1
             # Heartbeat: print at least every 15s so it doesn't look stuck.
             if self.verbose and (time.time() - _score_last_log >= 15.0 or _i == len(top_idx) - 1):
                 self._log(
                     f"  scored {scored_total}/{len(top_idx)} "
                     f"elapsed={time.time()-_score_t0:.0f}s "
-                    f"best_so_far={best_cost:.4f}  no_improve={no_improve}"
+                    f"best_so_far={best_cost:.4f}"
                 )
                 _score_last_log = time.time()
-            # Plateau early-exit (after we've scored at least min_scored)
-            if scored_total >= min_scored and no_improve >= plateau_th:
-                self._log(
-                    f"  plateau: {no_improve} non-improving candidates in a row; "
-                    f"stopping early at {scored_total}/{len(top_idx)} "
-                    f"(saved ~{(len(top_idx)-scored_total)*((time.time()-_score_t0)/scored_total):.0f}s)"
-                )
-                break
             # Hard wall-clock check: respect the koral budget ceiling.
             if self._koral_deadline is not None and time.time() >= self._koral_deadline:
                 self._log(
