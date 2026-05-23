@@ -518,7 +518,7 @@ class GraphGradPlacer:
         run_regional: bool = True,
         regional_grid_sizes: Tuple[int, ...] = (2, 2),
         regional_min_macros: int = 30,
-        regional_budget_s: float = 2000.0,
+        regional_budget_s: float = 1500.0,
         regional_use_gpu: bool = True,       # <-- Add this
         regional_n_chains: int = 8,
         # Phase 5 — Global LAHC
