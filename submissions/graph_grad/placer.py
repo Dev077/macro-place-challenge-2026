@@ -501,7 +501,7 @@ class GraphGradPlacer:
         gp_budget_s: float = 300.0,
         # Phase α₂ (koral soft-only Adam)
         run_soft_adam: bool = True,
-        soft_K: int = 16,
+        soft_K: int = 8,
         soft_steps: int = 2500,
         soft_lr: float = 0.01,
         soft_budget_s: float = 220.0,
@@ -512,18 +512,18 @@ class GraphGradPlacer:
         run_lk: bool = True,
         lk_passes: int = 2,
         lk_neighbors: int = 24,
-        lk_chain_depth: int = 4,
+        lk_chain_depth: int = 8,
         lk_budget_s: float = 150.0,
         # Phase 4 — Hierarchical regional LAHC
         run_regional: bool = True,
-        regional_grid_sizes: Tuple[int, ...] = (2,3),
+        regional_grid_sizes: Tuple[int, ...] = (2),
         regional_min_macros: int = 30,
         regional_budget_s: float = 2000.0,
         regional_use_gpu: bool = True,       # <-- Add this
-        regional_n_chains: int = 16,
+        regional_n_chains: int = 8,
         # Phase 5 — Global LAHC
         run_lahc: bool = True,
-        lahc_list_len: int = 100,
+        lahc_list_len: int = 150,
         lahc_min_budget_s: float = 60.0,
     ):
         self.seed = seed
