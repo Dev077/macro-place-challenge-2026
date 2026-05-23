@@ -519,6 +519,8 @@ class GraphGradPlacer:
         regional_grid_sizes: Tuple[int, ...] = (3, 5, 7),
         regional_min_macros: int = 30,
         regional_budget_s: float = 2000.0,
+        regional_use_gpu: bool = True,       # <-- Add this
+        regional_n_chains: int = 8,
         # Phase 5 — Global LAHC
         run_lahc: bool = True,
         lahc_list_len: int = 100,
@@ -743,22 +745,57 @@ class GraphGradPlacer:
             and n_hard >= self.regional_min_macros
             and time.time() - t0 < self.time_budget_s - self.lahc_min_budget_s
         ):
-            budget = min(self.regional_budget_s,
-                         self.time_budget_s - (time.time() - t0) - self.lahc_min_budget_s)
-            self._log(
-                f"Phase 4: regional LAHC grids={self.regional_grid_sizes} budget={budget:.0f}s"
-            )
-            try:
-                lk_mod.regional_polish(
-                    ev,
-                    region_grids=self.regional_grid_sizes,
-                    time_budget_s=budget,
-                    seed=self.seed,
-                    verbose=self.verbose,
+            budget = min(self.regional_budget_s, self.time_budget_s - (time.time() - t0) - self.lahc_min_budget_s)
+            
+            if getattr(self, "regional_use_gpu", False):
+                self._log(
+                    f"Phase 4 (GPU): K={self.regional_n_chains} parallel chains  "
+                    f"grids={self.regional_grid_sizes}  budget={budget:.0f}s"
                 )
-                _commit(ev.positions.copy(), "regional")
-            except Exception as e:
-                self._log(f"Phase 4: exception: {e}")
+                try:
+                    import importlib.util as _ilu
+                    _rg_spec = _ilu.spec_from_file_location(
+                        "lk_placer_regional_gpu",
+                        str(Path(__file__).resolve().parent / "regional_gpu.py"),
+                    )
+                    _rg = _ilu.module_from_spec(_rg_spec)
+                    _rg_spec.loader.exec_module(_rg)
+                    
+                    _ranking_ev = ev
+                    def _true_proxy_of(pos_np):
+                        _ranking_ev.restore(pos_np)
+                        return _ranking_ev.proxy_cost()["proxy_cost"]
+                        
+                    best_positions_np, out = _rg.regional_polish_gpu(
+                        benchmark, ev.positions.copy(), plc,
+                        n_chains=self.regional_n_chains,
+                        region_grids=self.regional_grid_sizes,
+                        list_len=100,
+                        move_radius_frac=0.12,
+                        time_budget_s=budget,
+                        seed=self.seed,
+                        verbose=self.verbose,
+                        rerank_with_true_proxy_cb=_true_proxy_of,
+                    )
+                    _commit(best_positions_np, "regional-gpu")
+                except Exception as e:
+                    self._log(f"Phase 4 (GPU): exception: {e}")
+            else:
+                self._log(
+                    f"Phase 4: regional LAHC grids={self.regional_grid_sizes} budget={budget:.0f}s"
+                )
+                try:
+                    lk_mod.regional_polish(
+                        ev,
+                        region_grids=self.regional_grid_sizes,
+                        time_budget_s=budget,
+                        seed=self.seed,
+                        verbose=self.verbose,
+                    )
+                    _commit(ev.positions.copy(), "regional")
+                except Exception as e:
+                    self._log(f"Phase 4: exception: {e}")
+            
             if best_pos is not None:
                 ev.restore(best_pos)
 
